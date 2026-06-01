@@ -13,13 +13,17 @@ fi
 source "${ENV_FILE}"
 
 CAPTURE_SECONDS="${1:-60}"
-REMOTE_CAPTURE="${PI_DEPLOY_DIR}/test_output/noaa_162500_probe.iq"
+NOAA_STATION="${PI_NOAA_STATION:-KGG68_HOUSTON}"
+NOAA_FREQ_HZ="${PI_NOAA_FREQ_HZ:-162400000}"
+REMOTE_CAPTURE="${PI_DEPLOY_DIR}/test_output/noaa_${NOAA_STATION}_${NOAA_FREQ_HZ}_probe.iq"
 
 BEFORE_MESSAGES="$(
     ssh "${PI_USER}@${PI_HOST}" \
         "jq -r '.messages' '${PI_READSB_JSON_DIR}/aircraft.json'"
 )"
 
+echo "NOAA test station: ${NOAA_STATION}"
+echo "NOAA frequency:    ${NOAA_FREQ_HZ} Hz"
 echo "ADS-B messages before native probe: ${BEFORE_MESSAGES}"
 echo
 
@@ -30,7 +34,7 @@ ssh "${PI_USER}@${PI_HOST}" "
 
     '${PI_DEPLOY_DIR}/bin/rtl_audio_probe' \
         --serial '${PI_AUDIO_SERIAL}' \
-        --freq-hz 162500000 \
+        --freq-hz '${NOAA_FREQ_HZ}' \
         --sample-rate 1024000 \
         --seconds '${CAPTURE_SECONDS}' \
         --gain-db 40.2 \

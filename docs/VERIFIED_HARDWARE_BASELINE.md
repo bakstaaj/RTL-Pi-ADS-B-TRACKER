@@ -21,3 +21,27 @@ ADS-B is provided by an RTL-SDR-enabled `readsb` build installed as:
 
 ```text
 /usr/bin/readsb
+
+## Houston Native NOAA Receiver Baseline
+
+Development testing in the Houston area uses:
+
+| Item | Value |
+|---|---|
+| NOAA station | KGG68 Houston |
+| Frequency | 162.400 MHz NFM |
+| Audio receiver serial | `00000162` |
+| ADS-B receiver serial | `00001090` |
+
+The native Docker-cross-compiled NOAA receiver was verified while the `rtl-pi-readsb.service` ADS-B service remained active.
+
+Native receiver operating baseline:
+
+```text
+Station frequency:   162400000 Hz
+Tuner frequency:     162652000 Hz
+Tuning offset:       252000 Hz
+Input sample rate:   1008000 Hz
+Audio sample rate:   24000 Hz
+RF gain:             40.2 dB
+Audio output gain:   15000
