@@ -1,0 +1,18 @@
+[Unit]
+Description=RTL Pi ADS-B Tracker API Prototype
+After=network.target rtl-pi-readsb.service
+Requires=rtl-pi-readsb.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+EnvironmentFile=/opt/rtl-pi-adsb-tracker/config.env
+WorkingDirectory=/opt/rtl-pi-adsb-tracker
+ExecStart=/usr/bin/python3 /opt/rtl-pi-adsb-tracker/app/rtl_pi_api.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
