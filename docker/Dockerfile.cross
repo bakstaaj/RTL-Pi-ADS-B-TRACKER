@@ -1,0 +1,28 @@
+FROM debian:trixie-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TARGET_TRIPLE=aarch64-linux-gnu
+
+RUN dpkg --add-architecture arm64 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        file \
+        git \
+        make \
+        cmake \
+        ninja-build \
+        pkg-config \
+        crossbuild-essential-arm64 \
+        librtlsdr-dev:arm64 \
+        libusb-1.0-0-dev:arm64 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+ENV CC=aarch64-linux-gnu-gcc
+ENV CXX=aarch64-linux-gnu-g++
+ENV PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+ENV PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+
+CMD ["/bin/bash"]

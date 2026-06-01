@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE_NAME="rtl-pi-adsb-cross:trixie-arm64"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_DOCKER_PATH="$(cygpath -m "${REPO_ROOT}")"
+
+mkdir -p "${REPO_ROOT}/dist"
+
+echo "Building ARM64 rtl_audio_probe in Docker..."
+
+MSYS_NO_PATHCONV=1 docker run --rm \
+    --volume "${REPO_DOCKER_PATH}:/workspace" \
+    --workdir /workspace \
+    "${IMAGE_NAME}" \
+    bash -lc '
+        set -euo pipefail
+
+        mkdir -p dist
+
+        aarch64-linux-gnu-gcc \
+            -O2 \
+            -Wall \
+            -Wextra \
+            -Werror \
+            -o dist/rtl_audio_probe \
+            src/rtl_audio_probe.c \
+            $(pkg-config --cflags --libs librtlsdr) \
+            -lm
+
+        file dist/rtl_audio_probe
+    '
+
+echo
+echo "Built: ${REPO_ROOT}/dist/rtl_audio_probe"

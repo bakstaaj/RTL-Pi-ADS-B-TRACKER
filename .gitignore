@@ -1,0 +1,26 @@
+# Local target and credentials
+.pi.env
+
+# Build outputs
+dist/
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.exe
+
+# Captured test data
+test_output/
+*.wav
+*.iq
+
+# Local generated/runtime data
+downloads/
+tmp/
+
+# Editor/OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
