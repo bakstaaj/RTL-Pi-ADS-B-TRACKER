@@ -15,6 +15,7 @@ BIND_ADDRESS = os.environ.get("RTL_PI_BIND", "0.0.0.0")
 PORT = int(os.environ.get("RTL_PI_PORT", "8080"))
 
 ROOT = Path(os.environ.get("RTL_PI_ROOT", "/opt/rtl-pi-adsb-tracker"))
+WEB_ROOT = ROOT / "web"
 OUTPUT_DIR = ROOT / "test_output"
 
 READSB_JSON_DIR = Path(
@@ -210,6 +211,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         request = urlparse(self.path)
+
+        if request.path in ("/", "/index.html"):
+            self.send_existing_file(
+                WEB_ROOT / "index.html",
+                "text/html; charset=utf-8",
+            )
+            return
 
         if request.path == "/api/status":
             self.send_json(build_status())

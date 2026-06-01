@@ -44,11 +44,15 @@ echo "Deploying API backend to ${PI_USER}@${PI_HOST}..."
 ssh "${PI_USER}@${PI_HOST}" "
     mkdir -p \
         '${PI_DEPLOY_DIR}/app' \
+        '${PI_DEPLOY_DIR}/web' \
         '${PI_DEPLOY_DIR}/test_output'
 "
 
 scp "${REPO_ROOT}/src/rtl_pi_api.py" \
     "${PI_USER}@${PI_HOST}:${PI_DEPLOY_DIR}/app/rtl_pi_api.py"
+
+scp "${REPO_ROOT}/web/index.html" \
+    "${PI_USER}@${PI_HOST}:${PI_DEPLOY_DIR}/web/index.html"
 
 scp "${TEMP_CONFIG}" \
     "${PI_USER}@${PI_HOST}:${PI_DEPLOY_DIR}/config.env"

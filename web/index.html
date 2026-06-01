@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RTL Pi ADS-B Tracker</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --page: #09101d;
+      --panel: #111c2d;
+      --panel2: #17253a;
+      --border: #263b56;
+      --text: #e4edf6;
+      --muted: #9db2cb;
+      --button: #2878d4;
+      --button-hover: #3489e9;
+      --good: #49d38c;
+      --warning: #f6c453;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      background: var(--page);
+      color: var(--text);
+      font-family: Arial, Helvetica, sans-serif;
+      margin: 0;
+      padding: 22px;
+    }
+
+    h1 {
+      font-size: 27px;
+      margin: 0 0 6px;
+    }
+
+    h2 {
+      font-size: 18px;
+      font-weight: normal;
+      margin: 0 0 14px;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      margin-bottom: 20px;
+    }
+
+    .layout {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: minmax(330px, 430px) minmax(480px, 1fr);
+      max-width: 1300px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 18px;
+    }
+
+    .full-width {
+      grid-column: 1 / -1;
+    }
+
+    .stats {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(2, minmax(120px, 1fr));
+    }
+
+    .stat {
+      background: var(--panel2);
+      border-radius: 7px;
+      padding: 12px;
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .value {
+      font-size: 28px;
+      margin-top: 6px;
+    }
+
+    .status-ready {
+      color: var(--good);
+    }
+
+    .status-busy {
+      color: var(--warning);
+    }
+
+    .station {
+      background: var(--panel2);
+      border-radius: 7px;
+      margin-bottom: 13px;
+      padding: 12px;
+    }
+
+    .station strong {
+      display: block;
+      font-size: 17px;
+      margin-bottom: 5px;
+    }
+
+    .station span {
+      color: var(--muted);
+    }
+
+    button {
+      background: var(--button);
+      border: none;
+      border-radius: 6px;
+      color: white;
+      cursor: pointer;
+      font-size: 15px;
+      margin: 4px 6px 4px 0;
+      padding: 11px 14px;
+    }
+
+    button:hover:not(:disabled) {
+      background: var(--button-hover);
+    }
+
+    button:disabled {
+      cursor: wait;
+      opacity: 0.55;
+    }
+
+    audio {
+      display: block;
+      margin-top: 16px;
+      width: 100%;
+    }
+
+    #audioMessage {
+      color: var(--muted);
+      line-height: 1.4;
+      margin-top: 14px;
+      min-height: 42px;
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: normal;
+      letter-spacing: 0.05em;
+      text-align: left;
+      text-transform: uppercase;
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--border);
+      padding: 9px 8px;
+      white-space: nowrap;
+    }
+
+    td {
+      font-size: 14px;
+    }
+
+    .empty {
+      color: var(--muted);
+      padding: 24px 8px;
+      text-align: center;
+    }
+
+    .footer {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 16px;
+    }
+
+    @media (max-width: 900px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <h1>RTL Pi ADS-B Tracker</h1>
+  <div class="subtitle">Dual RTL-SDR prototype: continuous ADS-B tracking with independent NOAA audio reception.</div>
+
+  <div class="layout">
+    <section class="panel">
+      <h2>Receiver Status</h2>
+
+      <div class="station">
+        <strong id="stationName">Loading NOAA configuration…</strong>
+        <span id="stationDetails"></span>
+      </div>
+
+      <div class="stats">
+        <div class="stat">
+          <div class="label">ADS-B Messages</div>
+          <div class="value" id="messageCount">—</div>
+        </div>
+
+        <div class="stat">
+          <div class="label">Aircraft</div>
+          <div class="value" id="aircraftCount">—</div>
+        </div>
+
+        <div class="stat">
+          <div class="label">With Position</div>
+          <div class="value" id="positionCount">—</div>
+        </div>
+
+        <div class="stat">
+          <div class="label">Audio Receiver</div>
+          <div class="value status-ready" id="audioState">—</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>NOAA Weather Radio Audio</h2>
+
+      <p>
+        Capture and play completed NOAA audio samples using the dedicated
+        VHF receiver. ADS-B tracking continues during capture.
+      </p>
+
+      <button id="capture10" type="button">Capture 10 Seconds</button>
+      <button id="capture30" type="button">Capture 30 Seconds</button>
+
+      <audio id="audioPlayer" controls preload="none"></audio>
+
+      <div id="audioMessage">
+        Ready for NOAA audio capture.
+      </div>
+    </section>
+
+    <section class="panel full-width">
+      <h2>Current Aircraft</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>ICAO</th>
+            <th>Flight</th>
+            <th>Altitude</th>
+            <th>Speed</th>
+            <th>Track</th>
+            <th>Latitude</th>
+            <th>Longitude</th>
+            <th>Seen</th>
+          </tr>
+        </thead>
+        <tbody id="aircraftRows">
+          <tr><td class="empty" colspan="8">Loading aircraft data…</td></tr>
+        </tbody>
+      </table>
+
+      <div class="footer">
+        Aircraft data supplied by the dedicated readsb ADS-B service.
+      </div>
+    </section>
+  </div>
+
+<script>
+'use strict';
+
+let activeAudioUrl = null;
+let captureRunning = false;
+
+function setText(id, value) {
+  document.getElementById(id).textContent = value;
+}
+
+function formatNumber(value) {
+  return typeof value === 'number' ? value.toLocaleString() : '—';
+}
+
+function setCaptureState(running) {
+  captureRunning = running;
+
+  document.getElementById('capture10').disabled = running;
+  document.getElementById('capture30').disabled = running;
+
+  const state = document.getElementById('audioState');
+  state.textContent = running ? 'Busy' : 'Ready';
+  state.className = running ? 'value status-busy' : 'value status-ready';
+}
+
+function addCell(row, value) {
+  const cell = document.createElement('td');
+  cell.textContent = value ?? '';
+  row.appendChild(cell);
+}
+
+async function refreshStatus() {
+  try {
+    const response = await fetch('/api/status', {cache: 'no-store'});
+    if (!response.ok) {
+      throw new Error(`Status endpoint returned ${response.status}`);
+    }
+
+    const status = await response.json();
+
+    setText('stationName', status.noaa_station || 'NOAA');
+    setText(
+      'stationDetails',
+      `${(status.noaa_frequency_hz / 1000000).toFixed(3)} MHz NFM · RTL-SDR ${status.audio_receiver_serial}`
+    );
+
+    setText('messageCount', formatNumber(status.messages));
+    setText('aircraftCount', formatNumber(status.aircraft_count));
+    setText('positionCount', formatNumber(status.aircraft_with_position));
+
+    if (!captureRunning) {
+      setCaptureState(Boolean(status.audio_busy));
+    }
+  } catch (error) {
+    setText('audioMessage', `Status error: ${error.message}`);
+  }
+}
+
+async function refreshAircraft() {
+  const tableBody = document.getElementById('aircraftRows');
+
+  try {
+    const response = await fetch('/api/aircraft.json', {cache: 'no-store'});
+    if (!response.ok) {
+      throw new Error(`Aircraft endpoint returned ${response.status}`);
+    }
+
+    const data = await response.json();
+    const aircraft = Array.isArray(data.aircraft) ? data.aircraft.slice(0, 20) : [];
+
+    tableBody.replaceChildren();
+
+    if (aircraft.length === 0) {
+      const row = document.createElement('tr');
+      const cell = document.createElement('td');
+      cell.colSpan = 8;
+      cell.className = 'empty';
+      cell.textContent = 'No current aircraft records.';
+      row.appendChild(cell);
+      tableBody.appendChild(row);
+      return;
+    }
+
+    for (const item of aircraft) {
+      const row = document.createElement('tr');
+
+      addCell(row, item.hex);
+      addCell(row, item.flight ? item.flight.trim() : '');
+      addCell(row, item.alt_baro);
+      addCell(row, item.gs);
+      addCell(row, item.track);
+      addCell(row, item.lat);
+      addCell(row, item.lon);
+      addCell(row, item.seen);
+
+      tableBody.appendChild(row);
+    }
+  } catch (error) {
+    tableBody.replaceChildren();
+
+    const row = document.createElement('tr');
+    const cell = document.createElement('td');
+    cell.colSpan = 8;
+    cell.className = 'empty';
+    cell.textContent = `Aircraft data error: ${error.message}`;
+    row.appendChild(cell);
+    tableBody.appendChild(row);
+  }
+}
+
+async function captureAudio(seconds) {
+  const message = document.getElementById('audioMessage');
+  const player = document.getElementById('audioPlayer');
+
+  setCaptureState(true);
+  message.textContent = `Capturing ${seconds} seconds of NOAA audio. ADS-B remains active…`;
+
+  try {
+    const response = await fetch(
+      `/api/noaa/capture.wav?seconds=${seconds}&request=${Date.now()}`,
+      {cache: 'no-store'}
+    );
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(body);
+    }
+
+    const wavBlob = await response.blob();
+
+    if (activeAudioUrl) {
+      URL.revokeObjectURL(activeAudioUrl);
+    }
+
+    activeAudioUrl = URL.createObjectURL(wavBlob);
+    player.src = activeAudioUrl;
+    player.load();
+
+    try {
+      await player.play();
+      message.textContent = `Playing completed ${seconds}-second NOAA recording.`;
+    } catch (_) {
+      message.textContent = `Capture complete. Press Play to hear the ${seconds}-second NOAA recording.`;
+    }
+  } catch (error) {
+    message.textContent = `Audio capture failed: ${error.message}`;
+  } finally {
+    setCaptureState(false);
+    await refreshStatus();
+    await refreshAircraft();
+  }
+}
+
+document.getElementById('capture10').addEventListener('click', () => captureAudio(10));
+document.getElementById('capture30').addEventListener('click', () => captureAudio(30));
+
+refreshStatus();
+refreshAircraft();
+
+setInterval(refreshStatus, 2000);
+setInterval(refreshAircraft, 2000);
+</script>
+</body>
+</html>
