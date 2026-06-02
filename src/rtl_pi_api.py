@@ -26,7 +26,14 @@ NOAA_STATION = os.environ.get("RTL_PI_NOAA_STATION", "KGG68_HOUSTON")
 NOAA_FREQ_HZ = int(os.environ.get("RTL_PI_NOAA_FREQ_HZ", "162400000"))
 RF_GAIN_DB = os.environ.get("RTL_PI_RF_GAIN_DB", "40.2")
 AUDIO_OUTPUT_GAIN = os.environ.get("RTL_PI_AUDIO_OUTPUT_GAIN", "15000")
+SURVEY_BINARY = Path(
+    os.environ.get("RTL_PI_NOAA_SURVEY_BINARY", "/opt/rtl-pi-adsb-tracker/bin/rtl_noaa_survey")
+)
+SURVEY_SECONDS = int(os.environ.get("RTL_PI_NOAA_SURVEY_SECONDS", "2"))
 AUDIO_RATE_HZ = 24000
+
+selected_noaa_frequency_hz = NOAA_FREQ_HZ
+selected_noaa_station = NOAA_STATION
 CAPTURE_WAV_PATH = OUTPUT_DIR / "api_last_noaa_capture.wav"
 LIVE_WAV_PATH = OUTPUT_DIR / "live_noaa_source.wav"
 LIVE_LOG_PATH = OUTPUT_DIR / "live_noaa_receiver.log"
@@ -43,6 +50,8 @@ runtime_state: dict[str, object] = {
     "live_start_time": None,
     "live_stop_time": None,
     "live_error": None,
+    "last_noaa_survey": None,
+    "last_noaa_survey_time": None,
 }
 
 def read_json(path: Path) -> dict:
@@ -108,8 +117,10 @@ def build_status() -> dict:
         "live_audio_running": live_running,
         "live_audio_available_samples": live_available_samples() if live_running else 0,
         "audio_receiver_serial": AUDIO_SERIAL,
-        "noaa_station": NOAA_STATION,
-        "noaa_frequency_hz": NOAA_FREQ_HZ,
+        "noaa_station": selected_noaa_station,
+        "noaa_frequency_hz": selected_noaa_frequency_hz,
+        "configured_noaa_station": NOAA_STATION,
+        "configured_noaa_frequency_hz": NOAA_FREQ_HZ,
         "rf_gain_db": RF_GAIN_DB,
         "audio_output_gain": AUDIO_OUTPUT_GAIN,
         **state,
@@ -160,7 +171,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             safe_unlink(CAPTURE_WAV_PATH)
-            command = [str(AUDIO_BINARY), "--serial", AUDIO_SERIAL, "--freq-hz", str(NOAA_FREQ_HZ),
+            command = [str(AUDIO_BINARY), "--serial", AUDIO_SERIAL, "--freq-hz", str(selected_noaa_frequency_hz),
                        "--seconds", str(seconds), "--gain-db", RF_GAIN_DB, "--audio-gain", AUDIO_OUTPUT_GAIN,
                        "--wav-output", str(CAPTURE_WAV_PATH)]
             result = subprocess.run(command, text=True, capture_output=True, timeout=seconds + 20, check=False)
@@ -183,6 +194,62 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             receiver_lock.release()
 
+    def auto_select_and_start_noaa(self) -> None:
+        global selected_noaa_frequency_hz, selected_noaa_station
+
+        if not receiver_lock.acquire(blocking=False):
+            self.send_json(
+                {"error": "Audio receiver is currently busy. Stop listening before rescanning NOAA."},
+                HTTPStatus.CONFLICT,
+            )
+            return
+
+        survey_path = OUTPUT_DIR / "noaa_auto_select_results.json"
+        survey = {}
+        try:
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            safe_unlink(survey_path)
+            command = [
+                str(SURVEY_BINARY),
+                "--serial", AUDIO_SERIAL,
+                "--seconds", str(SURVEY_SECONDS),
+                "--gain-db", RF_GAIN_DB,
+                "--json-output", str(survey_path),
+            ]
+            result = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                timeout=SURVEY_SECONDS * 7 + 20,
+                check=False,
+            )
+            if result.returncode != 0 or not survey_path.exists():
+                error_text = result.stderr.strip() or result.stdout.strip() or "NOAA survey failed."
+                self.send_json(
+                    {"error": "NOAA auto-select survey failed.", "details": error_text},
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+
+            survey = read_json(survey_path)
+            best_frequency = survey.get("best_frequency_hz")
+            if not isinstance(best_frequency, int):
+                self.send_json(
+                    {"error": "NOAA survey did not report a valid best frequency."},
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+
+            selected_noaa_frequency_hz = best_frequency
+            selected_noaa_station = f"AUTO SELECT — {best_frequency / 1000000.0:.3f} MHz"
+            with state_lock:
+                runtime_state["last_noaa_survey"] = survey
+                runtime_state["last_noaa_survey_time"] = int(time.time())
+        finally:
+            receiver_lock.release()
+
+        self.start_live_noaa()
+
     def start_live_noaa(self) -> None:
         global live_process, live_log_handle, live_holds_receiver_lock
         with state_lock:
@@ -196,7 +263,7 @@ class Handler(BaseHTTPRequestHandler):
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             safe_unlink(LIVE_WAV_PATH)
             safe_unlink(LIVE_LOG_PATH)
-            command = [str(AUDIO_BINARY), "--serial", AUDIO_SERIAL, "--freq-hz", str(NOAA_FREQ_HZ),
+            command = [str(AUDIO_BINARY), "--serial", AUDIO_SERIAL, "--freq-hz", str(selected_noaa_frequency_hz),
                        "--seconds", "3600", "--gain-db", RF_GAIN_DB, "--audio-gain", AUDIO_OUTPUT_GAIN,
                        "--wav-output", str(LIVE_WAV_PATH)]
             try:
@@ -260,6 +327,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         request = urlparse(self.path)
+        if request.path == "/api/noaa/auto/start":
+            self.auto_select_and_start_noaa()
+            return
+
         if request.path == "/api/noaa/live/start":
             self.start_live_noaa()
             return
