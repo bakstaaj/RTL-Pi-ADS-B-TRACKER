@@ -191,7 +191,8 @@ td { font-size: 13px; }
   <div class="map-toolbar">
     <button id="fitAircraftMap" type="button">Fit Aircraft</button>
     <button id="centerReceiverMap" type="button">Center Receiver</button>
-    <button id="clearAircraftTrails" type="button">Clear Trails</button>
+    <button id="clearAircraftTrails" type="button" title="Hide trail history in this browser. Restore Pi History can show archived Pi trails again.">Clear Display</button>
+    <button id="erasePiTrails" class="stop" type="button" title="Permanently delete stored Pi trail history collected so far.">Erase Pi History</button>
     <button id="loadPiTrails" type="button">Restore Pi History</button>
     <label>Retain Trails
       <select id="trailRetention">
@@ -212,7 +213,7 @@ td { font-size: 13px; }
     <span><i class="legend-line" style="border-color:#d4a600"></i>&lt; 40,001 ft</span>
     <span><i class="legend-line" style="border-color:#ff3030"></i>&gt; 40,000 ft</span>
   </div>
-  <div class="small">Trails accumulate in the browser while this page remains open. Map tiles require internet access from the browser workstation.</div>
+  <div class="small">Trails accumulate in the browser and on the Pi. Clear Display hides local trails and can be reversed with Restore Pi History; Erase Pi History permanently removes stored Pi tracks. Map tiles require internet access from the browser workstation.</div>
 </section>
 
 <section class="panel full">
@@ -577,7 +578,7 @@ function fitAircraftMap() {
 function centerReceiverMap() {
   if (aircraftMap && receiverMapLocation) aircraftMap.setView(receiverMapLocation, 10);
 }
-async function clearAircraftTrails() {
+function clearAircraftTrails() {
   if (!aircraftMap) return;
 
   removeTrailLayers();
@@ -588,7 +589,27 @@ async function clearAircraftTrails() {
   localStorage.setItem(TRAIL_CLEARED_AT_KEY, String(aircraftTrailClearedAt));
   localStorage.removeItem(TRAIL_STORAGE_KEY);
 
-  setMessage('mapMessage', 'Clearing browser and Pi-stored aircraft trails...', 'warning');
+  setMessage(
+    'mapMessage',
+    'Display cleared. Pi history is still stored; click Restore Pi History to show it again.',
+    'good'
+  );
+}
+
+async function erasePiTrailHistory() {
+  const confirmed = window.confirm(
+    'Erase all Pi-stored aircraft trail history collected so far? This cannot be restored.'
+  );
+  if (!confirmed) return;
+
+  removeTrailLayers();
+  aircraftLastPositions.clear();
+  aircraftTrailHistory.clear();
+  aircraftTrailClearedAt = Date.now();
+  localStorage.setItem(TRAIL_CLEARED_AT_KEY, String(aircraftTrailClearedAt));
+  localStorage.removeItem(TRAIL_STORAGE_KEY);
+
+  setMessage('mapMessage', 'Erasing browser and Pi-stored aircraft trails...', 'warning');
   try {
     const response = await fetch('/api/trails/clear', {method: 'POST', cache: 'no-store'});
     const result = await response.json();
@@ -597,13 +618,13 @@ async function clearAircraftTrails() {
     localStorage.setItem(TRAIL_CLEARED_AT_KEY, String(aircraftTrailClearedAt));
     setMessage(
       'mapMessage',
-      'Browser and Pi-stored trails cleared. Only post-clear movement will be retained.',
+      'Pi history erased. Only new post-erase movement will be retained.',
       'good'
     );
   } catch (error) {
     setMessage(
       'mapMessage',
-      `Browser trails cleared, but Pi history clear failed: ${error.message}`,
+      `Display cleared, but Pi history erase failed: ${error.message}`,
       'error'
     );
   }
@@ -952,6 +973,7 @@ function bindControls() {
   el('fitAircraftMap').addEventListener('click', fitAircraftMap);
   el('centerReceiverMap').addEventListener('click', centerReceiverMap);
   el('clearAircraftTrails').addEventListener('click', clearAircraftTrails);
+  el('erasePiTrails').addEventListener('click', erasePiTrailHistory);
   el('loadPiTrails').addEventListener('click', () => loadPiTrailHistory(true));
   el('trailRetention').addEventListener('change', changeTrailRetention);
   for (const id of ['locationName', 'locationLatitude', 'locationLongitude', 'locationRadius']) {
