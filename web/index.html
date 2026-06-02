@@ -192,6 +192,7 @@ td { font-size: 13px; }
     <button id="fitAircraftMap" type="button">Fit Aircraft</button>
     <button id="centerReceiverMap" type="button">Center Receiver</button>
     <button id="clearAircraftTrails" type="button">Clear Trails</button>
+    <button id="loadPiTrails" type="button">Restore Pi History</button>
     <label>Retain Trails
       <select id="trailRetention">
         <option value="15">15 minutes</option>
@@ -441,6 +442,76 @@ function recordTrailPoint(key, point, altitude) {
   aircraftLastPositions.set(key, point);
   saveTrailHistory();
 }
+async function loadPiTrailHistory(restoreCleared = false) {
+  try {
+    const response = await fetch('/api/trails/history', {cache: 'no-store'});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const serverTrails = data.trails || {};
+    const serverPointCount = Object.values(serverTrails)
+      .reduce((total, points) => total + (Array.isArray(points) ? points.length : 0), 0);
+
+    if (restoreCleared && serverPointCount > 0) {
+      aircraftTrailClearedAt = 0;
+      localStorage.removeItem(TRAIL_CLEARED_AT_KEY);
+    }
+
+    let restoredPointCount = 0;
+    let hiddenByClearCount = 0;
+    const beforeCount = Array.from(aircraftTrailHistory.values())
+      .reduce((total, points) => total + points.length, 0);
+
+    for (const [key, points] of Object.entries(serverTrails)) {
+      if (!Array.isArray(points)) continue;
+      const eligible = points.filter(point => {
+        const allowed = restoreCleared || Number(point.time) >= aircraftTrailClearedAt;
+        if (!allowed) hiddenByClearCount += 1;
+        return allowed;
+      });
+      const existing = aircraftTrailHistory.get(key) || [];
+      const merged = [...existing, ...eligible]
+        .sort((left, right) => Number(left.time) - Number(right.time));
+      const unique = [];
+      const seen = new Set();
+      for (const point of merged) {
+        const signature = `${point.time}|${point.lat}|${point.lon}`;
+        if (!seen.has(signature)) {
+          seen.add(signature);
+          unique.push(point);
+        }
+      }
+      if (unique.length) {
+        aircraftTrailHistory.set(key, unique);
+      }
+    }
+
+    saveTrailHistory();
+    renderStoredTrails();
+
+    const afterCount = Array.from(aircraftTrailHistory.values())
+      .reduce((total, points) => total + points.length, 0);
+    restoredPointCount = Math.max(0, afterCount - beforeCount);
+
+    if (!serverPointCount) {
+      setMessage('mapMessage', 'Pi trail collector has no saved positioned aircraft yet.', '');
+    } else if (restoreCleared) {
+      setMessage('mapMessage',
+        `Restored Pi history: ${serverPointCount} stored points across ${Object.keys(serverTrails).length} aircraft; ${restoredPointCount} points were newly added to this map.`,
+        'good');
+    } else if (hiddenByClearCount) {
+      setMessage('mapMessage',
+        `Pi has ${serverPointCount} stored points, but ${hiddenByClearCount} pre-clear points remain hidden. Click Restore Pi History to display them again.`,
+        'warning');
+    } else {
+      setMessage('mapMessage',
+        `Loaded Pi history: ${serverPointCount} stored points across ${Object.keys(serverTrails).length} aircraft; ${restoredPointCount} points were newly added.`,
+        'good');
+    }
+  } catch (error) {
+    setMessage('mapMessage', `Pi trail history unavailable: ${error.message}`, 'error');
+  }
+}
+
 function changeTrailRetention() {
   aircraftTrailRetentionMinutes = Number(el('trailRetention').value);
   saveTrailHistory();
@@ -867,6 +938,7 @@ function bindControls() {
   el('fitAircraftMap').addEventListener('click', fitAircraftMap);
   el('centerReceiverMap').addEventListener('click', centerReceiverMap);
   el('clearAircraftTrails').addEventListener('click', clearAircraftTrails);
+  el('loadPiTrails').addEventListener('click', () => loadPiTrailHistory(true));
   el('trailRetention').addEventListener('change', changeTrailRetention);
   for (const id of ['locationName', 'locationLatitude', 'locationLongitude', 'locationRadius']) {
     el(id).addEventListener('input', () => { el('locationName').dataset.edited = 'true'; });
@@ -888,6 +960,7 @@ document.addEventListener('DOMContentLoaded', () => {
   el('trailRetention').value = String(aircraftTrailRetentionMinutes);
   renderStoredTrails();
   bindControls();
+  loadPiTrailHistory();
   updateStatus();
   updateAircraft();
   window.setInterval(updateStatus, 2000);

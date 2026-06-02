@@ -23,6 +23,7 @@ WEB_ROOT = ROOT / "web"
 OUTPUT_DIR = ROOT / "test_output"
 SETTINGS_DIR = ROOT / "settings"
 RECEIVER_LOCATION_PATH = SETTINGS_DIR / "receiver_location.json"
+TRAIL_HISTORY_PATH = SETTINGS_DIR / "aircraft_trails_history.json"
 DATA_DIR = ROOT / "data"
 AIRBAND_DATA_PATH = DATA_DIR / "airband_frequencies_full.json"
 READSB_JSON_DIR = Path(os.environ.get("RTL_PI_READSB_JSON_DIR", "/run/rtl-pi-readsb"))
@@ -63,6 +64,9 @@ live_log_handle = None
 live_holds_receiver_lock = False
 airband_scan_stop_event = threading.Event()
 airband_scan_thread: threading.Thread | None = None
+airband_test_stop_event = threading.Event()
+airband_test_command_event = threading.Event()
+airband_test_thread: threading.Thread | None = None
 runtime_state: dict[str, object] = {
     "last_capture_time": None,
     "last_capture_seconds": None,
@@ -81,6 +85,16 @@ runtime_state: dict[str, object] = {
     "airband_last_signal_snr_db": None,
     "airband_last_detection": None,
     "airband_scan_error": None,
+    "airband_test_running": False,
+    "airband_test_state": "idle",
+    "airband_test_cycle": 0,
+    "airband_test_current_channel": None,
+    "airband_test_active_channel": None,
+    "airband_test_silence_remaining": None,
+    "airband_test_hold": False,
+    "airband_test_command": None,
+    "airband_test_event_id": 0,
+    "airband_test_message": "SIMULATED: Test scanner is idle.",
     "airband_scan_scope": "priority",
     "airband_watch_frequency_hz": None,
     "airband_best_candidate": None,
@@ -392,6 +406,172 @@ def airband_scan_worker(channels: list[dict]) -> None:
         airband_scan_thread = None
 
 
+def simulated_airband_tone_wav() -> bytes:
+    # Obvious non-received test tone encoded as a short WAV block.
+    pcm_data = bytearray()
+    total_samples = int(AUDIO_RATE_HZ * 2.4)
+    for sample_index in range(total_samples):
+        time_seconds = sample_index / AUDIO_RATE_HZ
+        burst_index = int(time_seconds / 0.30)
+        active = burst_index % 2 == 0
+        frequency_hz = 750.0 if (burst_index // 2) % 2 == 0 else 1050.0
+        amplitude = 0.22 if active else 0.0
+        value = int(amplitude * 32767.0 * math.sin(2.0 * math.pi * frequency_hz * time_seconds))
+        pcm_data.extend(struct.pack("<h", value))
+    return wav_block_from_pcm(bytes(pcm_data))
+
+
+def set_airband_test_state(**updates: object) -> None:
+    with state_lock:
+        runtime_state.update(updates)
+
+
+def airband_test_wait(seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if airband_test_stop_event.wait(timeout=min(0.10, max(0.0, deadline - time.monotonic()))):
+            return False
+        if airband_test_command_event.is_set():
+            return True
+    return True
+
+
+def airband_test_get_command() -> str | None:
+    with state_lock:
+        command = runtime_state.get("airband_test_command")
+        runtime_state["airband_test_command"] = None
+    airband_test_command_event.clear()
+    return command if isinstance(command, str) else None
+
+
+def airband_test_worker(channels: list[dict]) -> None:
+    global airband_test_thread
+
+    simulated_index = 2 if len(channels) > 2 else 0
+    cycle = 0
+    try:
+        while not airband_test_stop_event.is_set():
+            cycle += 1
+            set_airband_test_state(
+                airband_test_cycle=cycle,
+                airband_test_state="scanning",
+                airband_test_active_channel=None,
+                airband_test_silence_remaining=None,
+                airband_test_hold=False,
+                airband_test_message="SIMULATED: Scanning test channels.",
+            )
+
+            detected_channel = None
+            for index, channel in enumerate(channels):
+                if airband_test_stop_event.is_set():
+                    break
+                set_airband_test_state(
+                    airband_test_current_channel=channel,
+                    airband_test_message=f"SIMULATED: Scanning {channel['frequency_mhz']:.3f} MHz.",
+                )
+                if not airband_test_wait(0.70):
+                    break
+                command = airband_test_get_command()
+                if command == "skip":
+                    continue
+                if index == simulated_index:
+                    detected_channel = channel
+                    break
+
+            if airband_test_stop_event.is_set():
+                break
+            if detected_channel is None:
+                continue
+
+            with state_lock:
+                event_id = int(runtime_state.get("airband_test_event_id", 0)) + 1
+            set_airband_test_state(
+                airband_test_event_id=event_id,
+                airband_test_state="listening_simulated_activity",
+                airband_test_current_channel=detected_channel,
+                airband_test_active_channel=detected_channel,
+                airband_test_message=(
+                    f"SIMULATED ACTIVITY: Listening on {detected_channel['frequency_mhz']:.3f} MHz."
+                ),
+            )
+
+            skipped = False
+            activity_end = time.monotonic() + 3.0
+            while time.monotonic() < activity_end and not airband_test_stop_event.is_set():
+                airband_test_wait(0.10)
+                command = airband_test_get_command()
+                if command == "hold":
+                    set_airband_test_state(airband_test_hold=True)
+                elif command == "skip":
+                    skipped = True
+                    break
+
+            if airband_test_stop_event.is_set():
+                break
+            if skipped:
+                set_airband_test_state(
+                    airband_test_state="scanning",
+                    airband_test_message="SIMULATED: Channel skipped; resuming scan.",
+                )
+                continue
+
+            remaining = 7
+            while remaining > 0 and not airband_test_stop_event.is_set():
+                with state_lock:
+                    held = bool(runtime_state.get("airband_test_hold"))
+                if held:
+                    set_airband_test_state(
+                        airband_test_state="held",
+                        airband_test_silence_remaining=remaining,
+                        airband_test_message=(
+                            f"SIMULATED HOLD: Remaining on {detected_channel['frequency_mhz']:.3f} MHz."
+                        ),
+                    )
+                    airband_test_wait(0.20)
+                    command = airband_test_get_command()
+                    if command == "skip":
+                        remaining = 0
+                        break
+                    if command == "resume":
+                        set_airband_test_state(airband_test_hold=False)
+                    continue
+
+                set_airband_test_state(
+                    airband_test_state="silence_countdown",
+                    airband_test_silence_remaining=remaining,
+                    airband_test_message=(
+                        f"SIMULATED SILENCE: Resuming scan in {remaining} seconds."
+                    ),
+                )
+                if not airband_test_wait(1.0):
+                    break
+                command = airband_test_get_command()
+                if command == "hold":
+                    set_airband_test_state(airband_test_hold=True)
+                elif command == "skip":
+                    remaining = 0
+                    break
+                remaining -= 1
+
+            if airband_test_stop_event.is_set():
+                break
+            set_airband_test_state(
+                airband_test_state="scanning",
+                airband_test_silence_remaining=None,
+                airband_test_hold=False,
+                airband_test_message="SIMULATED: Silence interval complete; scan resumed.",
+            )
+    finally:
+        set_airband_test_state(
+            airband_test_running=False,
+            airband_test_state="stopped",
+            airband_test_silence_remaining=None,
+            airband_test_hold=False,
+            airband_test_message="SIMULATED: Test scan stopped.",
+        )
+        airband_test_thread = None
+
+
 def safe_unlink(path: Path) -> None:
     try:
         path.unlink()
@@ -617,6 +797,73 @@ class Handler(BaseHTTPRequestHandler):
             running = bool(runtime_state["airband_scan_running"])
         self.send_json({"stopping": running, **build_status()})
 
+    def start_airband_test_mode(self) -> None:
+        global airband_test_thread
+
+        location = read_receiver_location()
+        if location is None:
+            self.send_json(
+                {"error": "Set the receiver location before starting Airband Scanner Test Mode."},
+                HTTPStatus.CONFLICT,
+            )
+            return
+
+        nearby = nearby_airband_channels(location)
+        channels = nearby.get("channels", [])[:8]
+        if not channels:
+            self.send_json(
+                {"error": "No nearby channels are available for Airband Scanner Test Mode."},
+                HTTPStatus.CONFLICT,
+            )
+            return
+
+        with state_lock:
+            if runtime_state.get("airband_test_running"):
+                self.send_json({"started": False, "already_running": True, **build_status()})
+                return
+            runtime_state["airband_test_running"] = True
+            runtime_state["airband_test_state"] = "starting"
+            runtime_state["airband_test_cycle"] = 0
+            runtime_state["airband_test_current_channel"] = None
+            runtime_state["airband_test_active_channel"] = None
+            runtime_state["airband_test_silence_remaining"] = None
+            runtime_state["airband_test_hold"] = False
+            runtime_state["airband_test_command"] = None
+            runtime_state["airband_test_message"] = "SIMULATED: Starting Airband Scanner Test Mode."
+
+        airband_test_stop_event.clear()
+        airband_test_command_event.clear()
+        airband_test_thread = threading.Thread(
+            target=airband_test_worker,
+            args=(channels,),
+            daemon=True,
+            name="airband-test-mode",
+        )
+        airband_test_thread.start()
+        self.send_json(
+            {
+                "started": True,
+                "simulated": True,
+                "test_channel_count": len(channels),
+                "silence_resume_seconds": 7,
+                **build_status(),
+            }
+        )
+
+    def command_airband_test_mode(self, command: str) -> None:
+        with state_lock:
+            if not runtime_state.get("airband_test_running"):
+                self.send_json({"error": "Airband Scanner Test Mode is not running."}, HTTPStatus.CONFLICT)
+                return
+            runtime_state["airband_test_command"] = command
+        airband_test_command_event.set()
+        self.send_json({"accepted": True, "command": command, **build_status()})
+
+    def stop_airband_test_mode(self) -> None:
+        airband_test_stop_event.set()
+        airband_test_command_event.set()
+        self.send_json({"stopping": True, **build_status()})
+
     def capture_airband_audio(self, frequency_hz: int, seconds: int) -> None:
         location = read_receiver_location()
         if location is None:
@@ -808,6 +1055,27 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         request = urlparse(self.path)
 
+        if request.path == "/api/airband/test/start":
+            self.start_airband_test_mode()
+            return
+
+        if request.path == "/api/airband/test/stop":
+            self.stop_airband_test_mode()
+            return
+
+        if request.path == "/api/airband/test/hold":
+            self.command_airband_test_mode("hold")
+            return
+
+        if request.path == "/api/airband/test/skip":
+            self.command_airband_test_mode("skip")
+            return
+
+        if request.path == "/api/airband/test/resume":
+            self.command_airband_test_mode("resume")
+            return
+
+
         if request.path == "/api/settings/receiver":
             payload = self.read_request_json()
             if payload is None:
@@ -923,6 +1191,26 @@ class Handler(BaseHTTPRequestHandler):
                     "default_airband_radius_miles": 100,
                 }
             )
+            return
+
+        if request.path == "/api/airband/test/status":
+            self.send_json(build_status())
+            return
+
+        if request.path == "/api/airband/test/audio.wav":
+            self.send_bytes(simulated_airband_tone_wav(), "audio/wav")
+            return
+
+        if request.path == "/api/trails/history":
+            history = read_json(TRAIL_HISTORY_PATH)
+            if not history:
+                history = {
+                    "updated_utc": None,
+                    "retention_minutes": 240,
+                    "source": "readsb_pi_background_collector",
+                    "trails": {},
+                }
+            self.send_json(history)
             return
 
         if request.path == "/api/status":
