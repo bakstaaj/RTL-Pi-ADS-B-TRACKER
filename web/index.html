@@ -76,10 +76,12 @@ td { font-size: 13px; }
 .aircraft-icon-wrap { position: relative; width: 46px; height: 42px; }
 .aircraft-icon-wrap svg { display: block; filter: drop-shadow(0 1px 2px #000); transform-origin: 20px 20px; }
 .aircraft-icon-label {
-  position: absolute; left: 22px; top: 13px; white-space: nowrap;
-  color: #fff; background: rgba(8,16,29,.76); border-radius: 3px;
+  display: none; position: absolute; left: 22px; top: 13px; white-space: nowrap;
+  color: #fff; background: rgba(8,16,29,.88); border-radius: 3px;
   font-size: 11px; padding: 1px 4px; text-shadow: 0 1px 1px #000;
+  pointer-events: none;
 }
+.aircraft-icon-wrap:hover .aircraft-icon-label { display: block; }
 @media (max-width: 950px) {
   .layout { grid-template-columns: 1fr; }
   .settings-grid { grid-template-columns: 1fr 1fr; }
@@ -297,7 +299,7 @@ function setReceiverOnMap(location) {
   if (aircraftMapFirstFit) aircraftMap.setView(position, 10);
 }
 function aircraftMapIcon(aircraft) {
-  const color = '#9aa0a6';
+  const color = '#5f6670';
   const track = Number.isFinite(Number(aircraft.track)) ? Number(aircraft.track) : 0;
   const flight = aircraft.flight ? String(aircraft.flight).trim() : '';
   const label = flight || String(aircraft.hex || '').toUpperCase();
