@@ -34,12 +34,17 @@ AUDIO_OUTPUT_GAIN = os.environ.get("RTL_PI_AUDIO_OUTPUT_GAIN", "15000")
 SURVEY_BINARY = Path(
     os.environ.get("RTL_PI_NOAA_SURVEY_BINARY", "/opt/rtl-pi-adsb-tracker/bin/rtl_noaa_survey")
 )
+AIRBAND_BINARY = Path(
+    os.environ.get("RTL_PI_AIRBAND_BINARY", "/opt/rtl-pi-adsb-tracker/bin/rtl_airband_receiver")
+)
+AIRBAND_AUDIO_OUTPUT_GAIN = os.environ.get("RTL_PI_AIRBAND_AUDIO_OUTPUT_GAIN", "120000")
 SURVEY_SECONDS = int(os.environ.get("RTL_PI_NOAA_SURVEY_SECONDS", "2"))
 AUDIO_RATE_HZ = 24000
 
 selected_noaa_frequency_hz = NOAA_FREQ_HZ
 selected_noaa_station = NOAA_STATION
 CAPTURE_WAV_PATH = OUTPUT_DIR / "api_last_noaa_capture.wav"
+AIRBAND_CAPTURE_WAV_PATH = OUTPUT_DIR / "api_last_airband_capture.wav"
 LIVE_WAV_PATH = OUTPUT_DIR / "live_noaa_source.wav"
 LIVE_LOG_PATH = OUTPUT_DIR / "live_noaa_receiver.log"
 
@@ -360,6 +365,63 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             receiver_lock.release()
 
+    def capture_airband_audio(self, frequency_hz: int, seconds: int) -> None:
+        location = read_receiver_location()
+        if location is None:
+            self.send_json(
+                {"error": "Set the receiver location before listening to Airband channels."},
+                HTTPStatus.CONFLICT,
+            )
+            return
+
+        available = nearby_airband_channels(location)
+        channel = next(
+            (item for item in available["channels"] if item["frequency_hz"] == frequency_hz),
+            None,
+        )
+        if channel is None:
+            self.send_json(
+                {"error": "Requested Airband channel is not in the configured nearby channel list."},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        if not receiver_lock.acquire(blocking=False):
+            self.send_json(
+                {"error": "Audio receiver is currently in use. Stop NOAA listening first."},
+                HTTPStatus.CONFLICT,
+            )
+            return
+
+        try:
+            safe_unlink(AIRBAND_CAPTURE_WAV_PATH)
+            command = [
+                str(AIRBAND_BINARY),
+                "--serial", AUDIO_SERIAL,
+                "--freq-hz", str(frequency_hz),
+                "--seconds", str(seconds),
+                "--gain-db", RF_GAIN_DB,
+                "--audio-gain", AIRBAND_AUDIO_OUTPUT_GAIN,
+                "--wav-output", str(AIRBAND_CAPTURE_WAV_PATH),
+            ]
+            result = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                timeout=seconds + 20,
+                check=False,
+            )
+            if result.returncode != 0 or not AIRBAND_CAPTURE_WAV_PATH.exists():
+                error_text = result.stderr.strip() or result.stdout.strip() or "Native AM receiver failed."
+                self.send_json(
+                    {"error": "Airband AM capture failed.", "details": error_text},
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+            self.send_existing_file(AIRBAND_CAPTURE_WAV_PATH, "audio/wav")
+        finally:
+            receiver_lock.release()
+
     def auto_select_and_start_noaa(self) -> None:
         global selected_noaa_frequency_hz, selected_noaa_station
 
@@ -590,6 +652,17 @@ class Handler(BaseHTTPRequestHandler):
         if request.path == "/api/readsb/status.json":
             self.send_existing_file(READSB_STATUS_JSON, "application/json")
             return
+        if request.path == "/api/airband/capture.wav":
+            parameters = parse_qs(request.query)
+            try:
+                frequency_hz = int(parameters.get("frequency_hz", ["0"])[0])
+                seconds = int(parameters.get("seconds", ["10"])[0])
+            except ValueError:
+                self.send_json({"error": "Invalid Airband capture parameters."}, HTTPStatus.BAD_REQUEST)
+                return
+            self.capture_airband_audio(frequency_hz, min(max(seconds, 2), 60))
+            return
+
         if request.path == "/api/noaa/capture.wav":
             parameters = parse_qs(request.query)
             try:
