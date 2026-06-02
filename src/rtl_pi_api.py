@@ -17,6 +17,8 @@ PORT = int(os.environ.get("RTL_PI_PORT", "8080"))
 ROOT = Path(os.environ.get("RTL_PI_ROOT", "/opt/rtl-pi-adsb-tracker"))
 WEB_ROOT = ROOT / "web"
 OUTPUT_DIR = ROOT / "test_output"
+SETTINGS_DIR = ROOT / "settings"
+RECEIVER_LOCATION_PATH = SETTINGS_DIR / "receiver_location.json"
 READSB_JSON_DIR = Path(os.environ.get("RTL_PI_READSB_JSON_DIR", "/run/rtl-pi-readsb"))
 AIRCRAFT_JSON = READSB_JSON_DIR / "aircraft.json"
 READSB_STATUS_JSON = READSB_JSON_DIR / "status.json"
@@ -59,6 +61,54 @@ def read_json(path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
+
+def read_receiver_location() -> dict | None:
+    data = read_json(RECEIVER_LOCATION_PATH)
+    if not data:
+        return None
+    if (
+        isinstance(data.get("name"), str)
+        and isinstance(data.get("latitude"), (int, float))
+        and isinstance(data.get("longitude"), (int, float))
+        and isinstance(data.get("airband_radius_miles"), (int, float))
+    ):
+        return data
+    return None
+
+
+def validate_receiver_location(payload: dict) -> tuple[dict | None, str | None]:
+    name = str(payload.get("name", "")).strip()
+    try:
+        latitude = float(payload.get("latitude"))
+        longitude = float(payload.get("longitude"))
+        radius = float(payload.get("airband_radius_miles", 100))
+    except (TypeError, ValueError):
+        return None, "Latitude, longitude, and radius must be numeric."
+
+    if not name:
+        return None, "Receiver location name is required."
+    if latitude < -90.0 or latitude > 90.0:
+        return None, "Latitude must be between -90 and 90."
+    if longitude < -180.0 or longitude > 180.0:
+        return None, "Longitude must be between -180 and 180."
+    if radius <= 0.0 or radius > 500.0:
+        return None, "Airband radius must be greater than 0 and no more than 500 miles."
+
+    return {
+        "name": name,
+        "latitude": latitude,
+        "longitude": longitude,
+        "airband_radius_miles": radius,
+        "updated_utc": int(time.time()),
+    }, None
+
+
+def save_receiver_location(location: dict) -> None:
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    temporary_path = RECEIVER_LOCATION_PATH.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(location, indent=2) + "\n", encoding="utf-8")
+    temporary_path.replace(RECEIVER_LOCATION_PATH)
+
 
 def safe_unlink(path: Path) -> None:
     try:
@@ -106,6 +156,7 @@ def build_status() -> dict:
     with state_lock:
         live_running = refresh_live_process_locked()
         state = dict(runtime_state)
+    receiver_location = read_receiver_location()
     return {
         "service": "rtl-pi-api",
         "readsb_json_available": AIRCRAFT_JSON.exists(),
@@ -123,6 +174,8 @@ def build_status() -> dict:
         "configured_noaa_frequency_hz": NOAA_FREQ_HZ,
         "rf_gain_db": RF_GAIN_DB,
         "audio_output_gain": AUDIO_OUTPUT_GAIN,
+        "receiver_location_configured": receiver_location is not None,
+        "receiver_location": receiver_location,
         **state,
     }
 
@@ -155,6 +208,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_json(self, payload: object, status: HTTPStatus = HTTPStatus.OK) -> None:
         self.send_bytes(json.dumps(payload, indent=2).encode("utf-8"), "application/json; charset=utf-8", status)
+
+    def read_request_json(self) -> dict | None:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            raw_body = self.rfile.read(content_length)
+            payload = json.loads(raw_body.decode("utf-8"))
+            return payload if isinstance(payload, dict) else None
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
 
     def send_existing_file(self, path: Path, content_type: str) -> None:
         try:
@@ -327,6 +389,41 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         request = urlparse(self.path)
+
+        if request.path == "/api/settings/receiver":
+            payload = self.read_request_json()
+            if payload is None:
+                self.send_json({"error": "A JSON receiver-location body is required."}, HTTPStatus.BAD_REQUEST)
+                return
+            location, error = validate_receiver_location(payload)
+            if error is not None or location is None:
+                self.send_json({"error": error}, HTTPStatus.BAD_REQUEST)
+                return
+            save_receiver_location(location)
+            self.send_json({"saved": True, "receiver_location": location})
+            return
+
+        if request.path == "/api/airband/scan/start":
+            location = read_receiver_location()
+            if location is None:
+                self.send_json(
+                    {
+                        "error": "Set the receiver location before starting Airband Scan.",
+                        "receiver_location_required": True,
+                    },
+                    HTTPStatus.CONFLICT,
+                )
+                return
+            self.send_json(
+                {
+                    "error": "Airband scanning backend is the next development milestone.",
+                    "receiver_location_required": False,
+                    "receiver_location": location,
+                },
+                HTTPStatus.NOT_IMPLEMENTED,
+            )
+            return
+
         if request.path == "/api/noaa/auto/start":
             self.auto_select_and_start_noaa()
             return
@@ -344,6 +441,17 @@ class Handler(BaseHTTPRequestHandler):
         if request.path in ("/", "/index.html"):
             self.send_existing_file(WEB_ROOT / "index.html", "text/html; charset=utf-8")
             return
+        if request.path == "/api/settings/receiver":
+            location = read_receiver_location()
+            self.send_json(
+                {
+                    "configured": location is not None,
+                    "receiver_location": location,
+                    "default_airband_radius_miles": 100,
+                }
+            )
+            return
+
         if request.path == "/api/status":
             self.send_json(build_status())
             return

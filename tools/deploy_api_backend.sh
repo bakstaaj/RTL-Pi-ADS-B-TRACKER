@@ -45,6 +45,7 @@ ssh "${PI_USER}@${PI_HOST}" "
     mkdir -p \
         '${PI_DEPLOY_DIR}/app' \
         '${PI_DEPLOY_DIR}/web' \
+        '${PI_DEPLOY_DIR}/settings' \
         '${PI_DEPLOY_DIR}/test_output'
 "
 
