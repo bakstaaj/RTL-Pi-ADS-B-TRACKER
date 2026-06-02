@@ -4,10 +4,13 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import shutil
 import struct
 import subprocess
 import threading
 import time
+import wave
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +41,8 @@ AIRBAND_BINARY = Path(
     os.environ.get("RTL_PI_AIRBAND_BINARY", "/opt/rtl-pi-adsb-tracker/bin/rtl_airband_receiver")
 )
 AIRBAND_AUDIO_OUTPUT_GAIN = os.environ.get("RTL_PI_AIRBAND_AUDIO_OUTPUT_GAIN", "120000")
+AIRBAND_ACTIVITY_THRESHOLD_SNR_DB = float(os.environ.get("RTL_PI_AIRBAND_ACTIVITY_THRESHOLD_SNR_DB", "6.0"))
+AIRBAND_SCAN_SAMPLE_MILLISECONDS = int(os.environ.get("RTL_PI_AIRBAND_SCAN_SAMPLE_MILLISECONDS", "500"))
 SURVEY_SECONDS = int(os.environ.get("RTL_PI_NOAA_SURVEY_SECONDS", "2"))
 AUDIO_RATE_HZ = 24000
 
@@ -45,6 +50,9 @@ selected_noaa_frequency_hz = NOAA_FREQ_HZ
 selected_noaa_station = NOAA_STATION
 CAPTURE_WAV_PATH = OUTPUT_DIR / "api_last_noaa_capture.wav"
 AIRBAND_CAPTURE_WAV_PATH = OUTPUT_DIR / "api_last_airband_capture.wav"
+AIRBAND_SCAN_SAMPLE_PATH = OUTPUT_DIR / "airband_scan_sample.wav"
+AIRBAND_DETECTED_WAV_PATH = OUTPUT_DIR / "airband_detected_latest.wav"
+AIRBAND_BEST_WAV_PATH = OUTPUT_DIR / "airband_best_candidate.wav"
 LIVE_WAV_PATH = OUTPUT_DIR / "live_noaa_source.wav"
 LIVE_LOG_PATH = OUTPUT_DIR / "live_noaa_receiver.log"
 
@@ -53,6 +61,8 @@ state_lock = threading.RLock()
 live_process: subprocess.Popen[str] | None = None
 live_log_handle = None
 live_holds_receiver_lock = False
+airband_scan_stop_event = threading.Event()
+airband_scan_thread: threading.Thread | None = None
 runtime_state: dict[str, object] = {
     "last_capture_time": None,
     "last_capture_seconds": None,
@@ -62,6 +72,18 @@ runtime_state: dict[str, object] = {
     "live_error": None,
     "last_noaa_survey": None,
     "last_noaa_survey_time": None,
+    "airband_scan_running": False,
+    "airband_scan_state": "idle",
+    "airband_scan_cycles": 0,
+    "airband_channels_scanned": 0,
+    "airband_current_channel": None,
+    "airband_last_measurement_dbfs": None,
+    "airband_last_signal_snr_db": None,
+    "airband_last_detection": None,
+    "airband_scan_error": None,
+    "airband_scan_scope": "priority",
+    "airband_watch_frequency_hz": None,
+    "airband_best_candidate": None,
 }
 
 def read_json(path: Path) -> dict:
@@ -196,6 +218,36 @@ def normalize_airband_channel(record: dict, location: dict) -> dict | None:
     }
 
 
+def airband_channel_scan_priority(channel: dict) -> tuple[int, float, int]:
+    label = " ".join(
+        str(channel.get(field) or "")
+        for field in ("use", "category", "airport_name", "airport_id")
+    ).upper()
+
+    if any(term in label for term in ("ATIS", "AWOS", "ASOS")):
+        priority = 0
+    elif any(term in label for term in ("TOWER", "TWR", "APPROACH", "DEP", "GROUND", "GND", "CTAF", "UNICOM", "CLEARANCE")):
+        priority = 1
+    else:
+        priority = 2
+
+    return priority, float(channel["distance_miles"]), int(channel["frequency_hz"])
+
+
+def select_airband_scan_channels(channels: list[dict], scope: str) -> tuple[list[dict], str]:
+    ordered = sorted(channels, key=airband_channel_scan_priority)
+
+    if scope == "continuous":
+        selected = [channel for channel in ordered if airband_channel_scan_priority(channel)[0] == 0]
+        return (selected if selected else ordered, "continuous" if selected else "all_fallback")
+
+    if scope == "priority":
+        selected = [channel for channel in ordered if airband_channel_scan_priority(channel)[0] < 2]
+        return (selected if selected else ordered, "priority" if selected else "all_fallback")
+
+    return ordered, "all"
+
+
 def nearby_airband_channels(location: dict) -> dict:
     raw_channels, metadata = load_airband_dataset()
     radius_miles = float(location["airband_radius_miles"])
@@ -208,15 +260,136 @@ def nearby_airband_channels(location: dict) -> dict:
 
     selected.sort(key=lambda item: (item["distance_miles"], item["frequency_hz"], str(item.get("airport_id") or "")))
 
+    # FAA records can contain duplicate service labels on one RF channel.
+    # Scan each frequency only once, keeping the first/nearest sorted record.
+    unique_by_frequency: dict[int, dict] = {}
+    for channel in selected:
+        if channel["frequency_hz"] not in unique_by_frequency:
+            unique_by_frequency[channel["frequency_hz"]] = channel
+    unique_channels = list(unique_by_frequency.values())
+
     return {
         "data_available": AIRBAND_DATA_PATH.exists(),
         "data_path": str(AIRBAND_DATA_PATH),
         "data_metadata": metadata,
         "receiver_location": location,
         "radius_miles": radius_miles,
-        "channel_count": len(selected),
-        "channels": selected,
+        "raw_record_count": len(selected),
+        "duplicate_records_removed": len(selected) - len(unique_channels),
+        "channel_count": len(unique_channels),
+        "channels": unique_channels,
     }
+
+
+def pcm_wav_rms_dbfs(path: Path) -> float:
+    try:
+        with wave.open(str(path), "rb") as wav_file:
+            if wav_file.getnchannels() != 1 or wav_file.getsampwidth() != 2:
+                return -120.0
+            frames = wav_file.readframes(wav_file.getnframes())
+    except (FileNotFoundError, wave.Error, OSError):
+        return -120.0
+
+    count = len(frames) // 2
+    if count == 0:
+        return -120.0
+
+    total_square = 0.0
+    for (sample,) in struct.iter_unpack("<h", frames[:count * 2]):
+        normalized = sample / 32768.0
+        total_square += normalized * normalized
+
+    rms = math.sqrt(total_square / count)
+    return 20.0 * math.log10(max(rms, 1.0e-12))
+
+
+def airband_scan_worker(channels: list[dict]) -> None:
+    global airband_scan_thread
+    detection_found = False
+    try:
+        while not airband_scan_stop_event.is_set() and not detection_found:
+            with state_lock:
+                runtime_state["airband_scan_cycles"] = int(runtime_state["airband_scan_cycles"]) + 1
+                runtime_state["airband_scan_state"] = "searching"
+
+            for channel in channels:
+                if airband_scan_stop_event.is_set():
+                    break
+
+                safe_unlink(AIRBAND_SCAN_SAMPLE_PATH)
+                command = [
+                    str(AIRBAND_BINARY),
+                    "--serial", AUDIO_SERIAL,
+                    "--freq-hz", str(channel["frequency_hz"]),
+                    "--duration-ms", str(AIRBAND_SCAN_SAMPLE_MILLISECONDS),
+                    "--gain-db", RF_GAIN_DB,
+                    "--audio-gain", AIRBAND_AUDIO_OUTPUT_GAIN,
+                    "--wav-output", str(AIRBAND_SCAN_SAMPLE_PATH),
+                ]
+                result = subprocess.run(
+                    command,
+                    text=True,
+                    capture_output=True,
+                    timeout=(AIRBAND_SCAN_SAMPLE_MILLISECONDS / 1000.0) + 20,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    with state_lock:
+                        runtime_state["airband_scan_error"] = result.stderr.strip() or "AM scan sample failed."
+                    continue
+
+                rms_dbfs = pcm_wav_rms_dbfs(AIRBAND_SCAN_SAMPLE_PATH)
+                signal_match = re.search(r"RF estimated SNR:\s+(-?[0-9]+(?:\.[0-9]+)?) dB", result.stdout)
+                signal_snr_db = float(signal_match.group(1)) if signal_match else -30.0
+                candidate = {
+                    "channel": channel,
+                    "audio_rms_dbfs": round(rms_dbfs, 2),
+                    "rf_estimated_snr_db": round(signal_snr_db, 2),
+                    "observed_utc": int(time.time()),
+                    "audio_url": "/api/airband/scan/best_audio.wav",
+                }
+                with state_lock:
+                    runtime_state["airband_channels_scanned"] = int(runtime_state["airband_channels_scanned"]) + 1
+                    runtime_state["airband_current_channel"] = channel
+                    runtime_state["airband_last_measurement_dbfs"] = round(rms_dbfs, 2)
+                    runtime_state["airband_last_signal_snr_db"] = round(signal_snr_db, 2)
+                    previous_best = runtime_state.get("airband_best_candidate")
+                    if (
+                        previous_best is None
+                        or signal_snr_db > float(previous_best.get("rf_estimated_snr_db", -999.0))
+                    ):
+                        shutil.copyfile(AIRBAND_SCAN_SAMPLE_PATH, AIRBAND_BEST_WAV_PATH)
+                        runtime_state["airband_best_candidate"] = candidate
+
+                if signal_snr_db >= AIRBAND_ACTIVITY_THRESHOLD_SNR_DB:
+                    shutil.copyfile(AIRBAND_SCAN_SAMPLE_PATH, AIRBAND_DETECTED_WAV_PATH)
+                    detection = {
+                        "channel": channel,
+                        "audio_rms_dbfs": round(rms_dbfs, 2),
+                        "rf_estimated_snr_db": round(signal_snr_db, 2),
+                        "threshold_snr_db": AIRBAND_ACTIVITY_THRESHOLD_SNR_DB,
+                        "detected_utc": int(time.time()),
+                        "audio_url": "/api/airband/scan/last_audio.wav",
+                    }
+                    with state_lock:
+                        runtime_state["airband_last_detection"] = detection
+                        runtime_state["airband_scan_state"] = "activity_detected"
+                    detection_found = True
+                    break
+    except Exception as exc:
+        with state_lock:
+            runtime_state["airband_scan_error"] = str(exc)
+            runtime_state["airband_scan_state"] = "error"
+    finally:
+        with state_lock:
+            if airband_scan_stop_event.is_set():
+                runtime_state["airband_scan_state"] = "stopped"
+            elif not detection_found and runtime_state["airband_scan_state"] != "error":
+                runtime_state["airband_scan_state"] = "idle"
+            runtime_state["airband_scan_running"] = False
+        if receiver_lock.locked():
+            receiver_lock.release()
+        airband_scan_thread = None
 
 
 def safe_unlink(path: Path) -> None:
@@ -364,6 +537,85 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "NOAA capture timed out."}, HTTPStatus.GATEWAY_TIMEOUT)
         finally:
             receiver_lock.release()
+
+    def start_airband_activity_scan(self, scope: str = "priority", watch_frequency_hz: int | None = None) -> None:
+        global airband_scan_thread
+
+        location = read_receiver_location()
+        if location is None:
+            self.send_json(
+                {"error": "Set the receiver location before starting Airband Scan."},
+                HTTPStatus.CONFLICT,
+            )
+            return
+
+        nearby = nearby_airband_channels(location)
+        if watch_frequency_hz is not None:
+            channels = [
+                channel for channel in nearby.get("channels", [])
+                if channel["frequency_hz"] == watch_frequency_hz
+            ]
+            effective_scope = "single_channel_watch"
+        else:
+            channels, effective_scope = select_airband_scan_channels(nearby.get("channels", []), scope)
+        if not channels:
+            self.send_json(
+                {"error": "No nearby Airband channels are available for scanning."},
+                HTTPStatus.CONFLICT,
+            )
+            return
+
+        with state_lock:
+            if runtime_state["airband_scan_running"]:
+                self.send_json({"started": False, **build_status()})
+                return
+
+        if not receiver_lock.acquire(blocking=False):
+            self.send_json(
+                {"error": "Audio receiver is in use. Stop NOAA listening or AM playback first."},
+                HTTPStatus.CONFLICT,
+            )
+            return
+
+        safe_unlink(AIRBAND_DETECTED_WAV_PATH)
+        safe_unlink(AIRBAND_BEST_WAV_PATH)
+        airband_scan_stop_event.clear()
+        with state_lock:
+            runtime_state["airband_scan_running"] = True
+            runtime_state["airband_scan_state"] = "starting"
+            runtime_state["airband_scan_cycles"] = 0
+            runtime_state["airband_channels_scanned"] = 0
+            runtime_state["airband_current_channel"] = None
+            runtime_state["airband_last_measurement_dbfs"] = None
+            runtime_state["airband_last_signal_snr_db"] = None
+            runtime_state["airband_last_detection"] = None
+            runtime_state["airband_best_candidate"] = None
+            runtime_state["airband_scan_scope"] = effective_scope
+            runtime_state["airband_watch_frequency_hz"] = watch_frequency_hz
+            runtime_state["airband_scan_error"] = None
+
+        airband_scan_thread = threading.Thread(
+            target=airband_scan_worker,
+            args=(channels,),
+            daemon=True,
+            name="airband-activity-scan",
+        )
+        airband_scan_thread.start()
+        self.send_json({
+            "started": True,
+            "channel_count": len(channels),
+            "scan_scope": effective_scope,
+            "duplicate_records_removed": nearby.get("duplicate_records_removed", 0),
+            "priority_channel_count": sum(1 for item in channels if airband_channel_scan_priority(item)[0] < 2),
+            "activity_threshold_snr_db": AIRBAND_ACTIVITY_THRESHOLD_SNR_DB,
+            **build_status(),
+        })
+
+    def stop_airband_activity_scan(self) -> None:
+        airband_scan_stop_event.set()
+        with state_lock:
+            running = bool(runtime_state["airband_scan_running"])
+        self.send_json({"stopping": running, **build_status()})
 
     def capture_airband_audio(self, frequency_hz: int, seconds: int) -> None:
         location = read_receiver_location()
@@ -569,6 +821,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"saved": True, "receiver_location": location})
             return
 
+        if request.path == "/api/airband/scan/activity/start":
+            parameters = parse_qs(request.query)
+            scope = parameters.get("scope", ["priority"])[0]
+            if scope not in ("continuous", "priority", "all"):
+                scope = "priority"
+            try:
+                frequency_text = parameters.get("frequency_hz", [""])[0]
+                watch_frequency_hz = int(frequency_text) if frequency_text else None
+            except ValueError:
+                self.send_json({"error": "Invalid watch frequency."}, HTTPStatus.BAD_REQUEST)
+                return
+            self.start_airband_activity_scan(scope, watch_frequency_hz)
+            return
+
+        if request.path == "/api/airband/scan/activity/stop":
+            self.stop_airband_activity_scan()
+            return
+
         if request.path == "/api/airband/scan/start":
             location = read_receiver_location()
             if location is None:
@@ -607,6 +877,18 @@ class Handler(BaseHTTPRequestHandler):
         if request.path in ("/", "/index.html"):
             self.send_existing_file(WEB_ROOT / "index.html", "text/html; charset=utf-8")
             return
+        if request.path == "/api/airband/scan/status":
+            self.send_json(build_status())
+            return
+
+        if request.path == "/api/airband/scan/last_audio.wav":
+            self.send_existing_file(AIRBAND_DETECTED_WAV_PATH, "audio/wav")
+            return
+
+        if request.path == "/api/airband/scan/best_audio.wav":
+            self.send_existing_file(AIRBAND_BEST_WAV_PATH, "audio/wav")
+            return
+
         if request.path == "/api/airband/channels":
             location = read_receiver_location()
             if location is None:
