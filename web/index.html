@@ -71,6 +71,8 @@ td { font-size: 13px; }
 #aircraftMap { height: 590px; width: 100%; border: 1px solid var(--border); border-radius: 7px; background: #0a1422; }
 .map-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 10px; }
 .map-toolbar .message { flex: 1; min-width: 300px; margin-top: 0; }
+.map-toolbar label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.map-toolbar select { width: auto; margin-top: 0; padding: 8px; }
 .trail-legend { display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 12px; margin: 10px 0 2px; }
 .legend-line { display: inline-block; width: 21px; border-top: 4px solid; margin-right: 5px; vertical-align: middle; }
 .aircraft-icon-wrap { position: relative; width: 46px; height: 42px; }
@@ -190,6 +192,14 @@ td { font-size: 13px; }
     <button id="fitAircraftMap" type="button">Fit Aircraft</button>
     <button id="centerReceiverMap" type="button">Center Receiver</button>
     <button id="clearAircraftTrails" type="button">Clear Trails</button>
+    <label>Retain Trails
+      <select id="trailRetention">
+        <option value="15">15 minutes</option>
+        <option value="60" selected>1 hour</option>
+        <option value="240">4 hours</option>
+        <option value="0">Until cleared</option>
+      </select>
+    </label>
     <div id="mapMessage" class="message">Waiting for aircraft positions from readsb.</div>
   </div>
   <div id="aircraftMap"></div>
@@ -233,6 +243,10 @@ let aircraftMapMarkers = new Map();
 let aircraftLastPositions = new Map();
 let aircraftTrailSegments = new Map();
 let aircraftMapFirstFit = true;
+const TRAIL_STORAGE_KEY = 'rtlPiAdsbTrailHistoryV1';
+const TRAIL_RETENTION_KEY = 'rtlPiAdsbTrailRetentionMinutes';
+let aircraftTrailHistory = new Map();
+let aircraftTrailRetentionMinutes = Number(localStorage.getItem(TRAIL_RETENTION_KEY) || '60');
 
 function el(id) { return document.getElementById(id); }
 function setText(id, value) { const node = el(id); if (node) node.textContent = value; }
@@ -329,6 +343,104 @@ function aircraftPopup(aircraft) {
     `Altitude: ${altitude == null ? '—' : altitude.toLocaleString() + ' ft'}<br>` +
     `Speed: ${escapeHtml(speed)} &nbsp; Track: ${escapeHtml(track)}`;
 }
+function trailCutoffTime() {
+  return aircraftTrailRetentionMinutes > 0 ? Date.now() - aircraftTrailRetentionMinutes * 60000 : 0;
+}
+function pruneTrailHistory() {
+  const cutoff = trailCutoffTime();
+  let allPoints = [];
+  for (const [key, points] of aircraftTrailHistory.entries()) {
+    const retained = points.filter(point => !cutoff || point.time >= cutoff).slice(-1440);
+    if (retained.length) {
+      aircraftTrailHistory.set(key, retained);
+      allPoints.push(...retained.map(point => ({key: key, point: point})));
+    } else {
+      aircraftTrailHistory.delete(key);
+    }
+  }
+  if (allPoints.length > 12000) {
+    allPoints.sort((a, b) => a.point.time - b.point.time);
+    const removeCount = allPoints.length - 12000;
+    for (const entry of allPoints.slice(0, removeCount)) {
+      const points = aircraftTrailHistory.get(entry.key) || [];
+      const index = points.indexOf(entry.point);
+      if (index >= 0) points.splice(index, 1);
+      if (!points.length) aircraftTrailHistory.delete(entry.key);
+    }
+  }
+}
+function saveTrailHistory() {
+  try {
+    pruneTrailHistory();
+    const serializable = Object.fromEntries(aircraftTrailHistory.entries());
+    localStorage.setItem(TRAIL_STORAGE_KEY, JSON.stringify(serializable));
+    localStorage.setItem(TRAIL_RETENTION_KEY, String(aircraftTrailRetentionMinutes));
+  } catch (_) {
+    setMessage('mapMessage', 'Map is live, but browser storage could not save aircraft trails.', 'warning');
+  }
+}
+function loadTrailHistory() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(TRAIL_STORAGE_KEY) || '{}');
+    aircraftTrailHistory = new Map(Object.entries(saved).filter(([, points]) => Array.isArray(points)));
+    pruneTrailHistory();
+  } catch (_) {
+    aircraftTrailHistory = new Map();
+    localStorage.removeItem(TRAIL_STORAGE_KEY);
+  }
+}
+function removeTrailLayers() {
+  if (!aircraftMap) return;
+  for (const segments of aircraftTrailSegments.values()) {
+    for (const segment of segments) aircraftMap.removeLayer(segment);
+  }
+  aircraftTrailSegments.clear();
+}
+function addTrailSegment(key, prior, current) {
+  const segment = L.polyline(
+    [[prior.lat, prior.lon], [current.lat, current.lon]],
+    {color: trailColor(current.altitude), weight: 3, opacity: 0.86}
+  ).addTo(aircraftMap);
+  const segments = aircraftTrailSegments.get(key) || [];
+  segments.push(segment);
+  while (segments.length > 1440) aircraftMap.removeLayer(segments.shift());
+  aircraftTrailSegments.set(key, segments);
+}
+function renderStoredTrails() {
+  if (!aircraftMap) return;
+  removeTrailLayers();
+  aircraftLastPositions.clear();
+  pruneTrailHistory();
+  for (const [key, points] of aircraftTrailHistory.entries()) {
+    for (let index = 1; index < points.length; index += 1) {
+      addTrailSegment(key, points[index - 1], points[index]);
+    }
+    if (points.length) {
+      const last = points[points.length - 1];
+      aircraftLastPositions.set(key, [last.lat, last.lon]);
+    }
+  }
+}
+function recordTrailPoint(key, point, altitude) {
+  const points = aircraftTrailHistory.get(key) || [];
+  const previous = points.length ? points[points.length - 1] : null;
+  if (previous && previous.lat === point[0] && previous.lon === point[1]) return;
+  const current = {lat: point[0], lon: point[1], altitude: altitude, time: Date.now()};
+  if (previous) addTrailSegment(key, previous, current);
+  points.push(current);
+  aircraftTrailHistory.set(key, points);
+  aircraftLastPositions.set(key, point);
+  saveTrailHistory();
+}
+function changeTrailRetention() {
+  aircraftTrailRetentionMinutes = Number(el('trailRetention').value);
+  saveTrailHistory();
+  renderStoredTrails();
+  setMessage('mapMessage',
+    aircraftTrailRetentionMinutes ? `Trail history retained for ${aircraftTrailRetentionMinutes} minutes in this browser.` : 'Trail history retained in this browser until cleared.',
+    'good');
+}
+
 function updateAircraftMap(aircraftRecords) {
   if (!aircraftMap) return;
   const positioned = aircraftRecords.filter(item => Number.isFinite(Number(item.lat)) && Number.isFinite(Number(item.lon)));
@@ -338,17 +450,9 @@ function updateAircraftMap(aircraftRecords) {
     const key = String(aircraft.hex || aircraft.flight || `${aircraft.lat},${aircraft.lon}`);
     const point = [Number(aircraft.lat), Number(aircraft.lon)];
     visibleIds.add(key);
-    const color = trailColor(altitudeFeet(aircraft));
-    const prior = aircraftLastPositions.get(key);
-
-    if (prior && (prior[0] !== point[0] || prior[1] !== point[1])) {
-      const segment = L.polyline([prior, point], {color: color, weight: 3, opacity: 0.86}).addTo(aircraftMap);
-      const segments = aircraftTrailSegments.get(key) || [];
-      segments.push(segment);
-      while (segments.length > 120) aircraftMap.removeLayer(segments.shift());
-      aircraftTrailSegments.set(key, segments);
-    }
-    aircraftLastPositions.set(key, point);
+    const altitude = altitudeFeet(aircraft);
+    const color = trailColor(altitude);
+    recordTrailPoint(key, point, altitude);
 
     let marker = aircraftMapMarkers.get(key);
     if (!marker) {
@@ -746,6 +850,7 @@ function bindControls() {
   el('fitAircraftMap').addEventListener('click', fitAircraftMap);
   el('centerReceiverMap').addEventListener('click', centerReceiverMap);
   el('clearAircraftTrails').addEventListener('click', clearAircraftTrails);
+  el('trailRetention').addEventListener('change', changeTrailRetention);
   for (const id of ['locationName', 'locationLatitude', 'locationLongitude', 'locationRadius']) {
     el(id).addEventListener('input', () => { el('locationName').dataset.edited = 'true'; });
   }
@@ -753,6 +858,9 @@ function bindControls() {
 
 document.addEventListener('DOMContentLoaded', () => {
   initializeAircraftMap();
+  loadTrailHistory();
+  el('trailRetention').value = String(aircraftTrailRetentionMinutes);
+  renderStoredTrails();
   bindControls();
   updateStatus();
   updateAircraft();
