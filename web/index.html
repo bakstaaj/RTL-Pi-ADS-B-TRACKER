@@ -245,8 +245,10 @@ let aircraftTrailSegments = new Map();
 let aircraftMapFirstFit = true;
 const TRAIL_STORAGE_KEY = 'rtlPiAdsbTrailHistoryV1';
 const TRAIL_RETENTION_KEY = 'rtlPiAdsbTrailRetentionMinutes';
+const TRAIL_CLEARED_AT_KEY = 'rtlPiAdsbTrailClearedAtV1';
 let aircraftTrailHistory = new Map();
 let aircraftTrailRetentionMinutes = Number(localStorage.getItem(TRAIL_RETENTION_KEY) || '60');
+let aircraftTrailClearedAt = Number(localStorage.getItem(TRAIL_CLEARED_AT_KEY) || '0');
 
 function el(id) { return document.getElementById(id); }
 function setText(id, value) { const node = el(id); if (node) node.textContent = value; }
@@ -344,7 +346,10 @@ function aircraftPopup(aircraft) {
     `Speed: ${escapeHtml(speed)} &nbsp; Track: ${escapeHtml(track)}`;
 }
 function trailCutoffTime() {
-  return aircraftTrailRetentionMinutes > 0 ? Date.now() - aircraftTrailRetentionMinutes * 60000 : 0;
+  const retentionCutoff = aircraftTrailRetentionMinutes > 0
+    ? Date.now() - aircraftTrailRetentionMinutes * 60000
+    : 0;
+  return Math.max(retentionCutoff, aircraftTrailClearedAt);
 }
 function pruneTrailHistory() {
   const cutoff = trailCutoffTime();
@@ -373,7 +378,11 @@ function saveTrailHistory() {
   try {
     pruneTrailHistory();
     const serializable = Object.fromEntries(aircraftTrailHistory.entries());
-    localStorage.setItem(TRAIL_STORAGE_KEY, JSON.stringify(serializable));
+    if (aircraftTrailHistory.size) {
+      localStorage.setItem(TRAIL_STORAGE_KEY, JSON.stringify(serializable));
+    } else {
+      localStorage.removeItem(TRAIL_STORAGE_KEY);
+    }
     localStorage.setItem(TRAIL_RETENTION_KEY, String(aircraftTrailRetentionMinutes));
   } catch (_) {
     setMessage('mapMessage', 'Map is live, but browser storage could not save aircraft trails.', 'warning');
@@ -499,12 +508,20 @@ function centerReceiverMap() {
 }
 function clearAircraftTrails() {
   if (!aircraftMap) return;
-  for (const segments of aircraftTrailSegments.values()) {
-    for (const segment of segments) aircraftMap.removeLayer(segment);
-  }
-  aircraftTrailSegments.clear();
+
+  removeTrailLayers();
   aircraftLastPositions.clear();
-  setMessage('mapMessage', 'Aircraft trails cleared; new trails will build from subsequent positions.', '');
+  aircraftTrailHistory.clear();
+
+  aircraftTrailClearedAt = Date.now();
+  localStorage.setItem(TRAIL_CLEARED_AT_KEY, String(aircraftTrailClearedAt));
+  localStorage.removeItem(TRAIL_STORAGE_KEY);
+
+  setMessage(
+    'mapMessage',
+    'Stored aircraft trails cleared. Only movement received after this clear will build new trails.',
+    'good'
+  );
 }
 
 function updateAudioButtons(status) {
@@ -855,6 +872,15 @@ function bindControls() {
     el(id).addEventListener('input', () => { el('locationName').dataset.edited = 'true'; });
   }
 }
+
+window.addEventListener('storage', event => {
+  if (event.key === TRAIL_CLEARED_AT_KEY) {
+    aircraftTrailClearedAt = Number(event.newValue || '0');
+    loadTrailHistory();
+    renderStoredTrails();
+    setMessage('mapMessage', 'Stored aircraft trails were cleared in another tracker tab.', 'good');
+  }
+});
 
 document.addEventListener('DOMContentLoaded', () => {
   initializeAircraftMap();
