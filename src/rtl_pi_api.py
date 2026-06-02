@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import struct
 import subprocess
@@ -19,6 +20,8 @@ WEB_ROOT = ROOT / "web"
 OUTPUT_DIR = ROOT / "test_output"
 SETTINGS_DIR = ROOT / "settings"
 RECEIVER_LOCATION_PATH = SETTINGS_DIR / "receiver_location.json"
+DATA_DIR = ROOT / "data"
+AIRBAND_DATA_PATH = DATA_DIR / "airband_frequencies_full.json"
 READSB_JSON_DIR = Path(os.environ.get("RTL_PI_READSB_JSON_DIR", "/run/rtl-pi-readsb"))
 AIRCRAFT_JSON = READSB_JSON_DIR / "aircraft.json"
 READSB_STATUS_JSON = READSB_JSON_DIR / "status.json"
@@ -108,6 +111,107 @@ def save_receiver_location(location: dict) -> None:
     temporary_path = RECEIVER_LOCATION_PATH.with_suffix(".json.tmp")
     temporary_path.write_text(json.dumps(location, indent=2) + "\n", encoding="utf-8")
     temporary_path.replace(RECEIVER_LOCATION_PATH)
+
+
+def first_present(record: dict, names: tuple[str, ...]) -> object | None:
+    for name in names:
+        if name in record and record[name] not in (None, ""):
+            return record[name]
+    return None
+
+
+def as_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def haversine_miles(latitude_a: float, longitude_a: float, latitude_b: float, longitude_b: float) -> float:
+    earth_radius_miles = 3958.7613
+    lat_a = math.radians(latitude_a)
+    lat_b = math.radians(latitude_b)
+    delta_lat = math.radians(latitude_b - latitude_a)
+    delta_lon = math.radians(longitude_b - longitude_a)
+    a = (
+        math.sin(delta_lat / 2.0) ** 2
+        + math.cos(lat_a) * math.cos(lat_b) * math.sin(delta_lon / 2.0) ** 2
+    )
+    return earth_radius_miles * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
+
+def load_airband_dataset() -> tuple[list[dict], dict]:
+    data = read_json(AIRBAND_DATA_PATH)
+    channels = data.get("channels", [])
+    if not isinstance(channels, list):
+        channels = []
+    metadata = data.get("metadata", {})
+    return [item for item in channels if isinstance(item, dict)], metadata if isinstance(metadata, dict) else {}
+
+
+def normalize_airband_channel(record: dict, location: dict) -> dict | None:
+    category = str(record.get("category", "")).upper()
+    demodulation = str(record.get("demodulation", record.get("mode", "AM"))).upper()
+
+    if category == "NOAA_WEATHER" or demodulation not in ("AM", ""):
+        return None
+
+    latitude = as_float(first_present(record, ("latitude", "lat", "airport_latitude", "facility_latitude", "latitude_decimal")))
+    longitude = as_float(first_present(record, ("longitude", "lon", "airport_longitude", "facility_longitude", "longitude_decimal")))
+    if latitude is None or longitude is None:
+        return None
+
+    frequency_hz = as_float(first_present(record, ("frequency_hz",)))
+    frequency_mhz = as_float(first_present(record, ("frequency_mhz", "frequency", "freq_mhz")))
+    if frequency_hz is None and frequency_mhz is not None:
+        frequency_hz = round(frequency_mhz * 1000000.0)
+    if frequency_mhz is None and frequency_hz is not None:
+        frequency_mhz = frequency_hz / 1000000.0
+    if frequency_hz is None or frequency_mhz is None:
+        return None
+
+    distance_miles = haversine_miles(
+        float(location["latitude"]),
+        float(location["longitude"]),
+        latitude,
+        longitude,
+    )
+
+    return {
+        "frequency_hz": int(round(frequency_hz)),
+        "frequency_mhz": round(frequency_mhz, 3),
+        "demodulation": "AM",
+        "category": category or "AIRBAND",
+        "airport_id": first_present(record, ("airport_id", "icao", "icao_id", "facility_id", "identifier", "site_number")),
+        "airport_name": first_present(record, ("airport_name", "facility_name", "name", "airport")),
+        "use": first_present(record, ("use", "description", "frequency_use", "service", "type")),
+        "latitude": latitude,
+        "longitude": longitude,
+        "distance_miles": round(distance_miles, 1),
+    }
+
+
+def nearby_airband_channels(location: dict) -> dict:
+    raw_channels, metadata = load_airband_dataset()
+    radius_miles = float(location["airband_radius_miles"])
+    selected: list[dict] = []
+
+    for record in raw_channels:
+        channel = normalize_airband_channel(record, location)
+        if channel is not None and channel["distance_miles"] <= radius_miles:
+            selected.append(channel)
+
+    selected.sort(key=lambda item: (item["distance_miles"], item["frequency_hz"], str(item.get("airport_id") or "")))
+
+    return {
+        "data_available": AIRBAND_DATA_PATH.exists(),
+        "data_path": str(AIRBAND_DATA_PATH),
+        "data_metadata": metadata,
+        "receiver_location": location,
+        "radius_miles": radius_miles,
+        "channel_count": len(selected),
+        "channels": selected,
+    }
 
 
 def safe_unlink(path: Path) -> None:
@@ -441,6 +545,31 @@ class Handler(BaseHTTPRequestHandler):
         if request.path in ("/", "/index.html"):
             self.send_existing_file(WEB_ROOT / "index.html", "text/html; charset=utf-8")
             return
+        if request.path == "/api/airband/channels":
+            location = read_receiver_location()
+            if location is None:
+                self.send_json(
+                    {
+                        "error": "Set the receiver location before loading nearby Airband channels.",
+                        "receiver_location_required": True,
+                    },
+                    HTTPStatus.CONFLICT,
+                )
+                return
+            result = nearby_airband_channels(location)
+            if not result["data_available"]:
+                self.send_json(
+                    {
+                        "error": "Airband frequency data has not been deployed.",
+                        "data_available": False,
+                        "receiver_location": location,
+                    },
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+            self.send_json(result)
+            return
+
         if request.path == "/api/settings/receiver":
             location = read_receiver_location()
             self.send_json(

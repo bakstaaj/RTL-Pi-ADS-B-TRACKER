@@ -46,6 +46,7 @@ ssh "${PI_USER}@${PI_HOST}" "
         '${PI_DEPLOY_DIR}/app' \
         '${PI_DEPLOY_DIR}/web' \
         '${PI_DEPLOY_DIR}/settings' \
+        '${PI_DEPLOY_DIR}/data' \
         '${PI_DEPLOY_DIR}/test_output'
 "
 
@@ -54,6 +55,14 @@ scp "${REPO_ROOT}/src/rtl_pi_api.py" \
 
 scp "${REPO_ROOT}/web/index.html" \
     "${PI_USER}@${PI_HOST}:${PI_DEPLOY_DIR}/web/index.html"
+
+if [[ -f "${REPO_ROOT}/data/airband_frequencies_full.json" ]]; then
+    echo "Deploying FAA-derived airband frequency data..."
+    scp "${REPO_ROOT}/data/airband_frequencies_full.json" \
+        "${PI_USER}@${PI_HOST}:${PI_DEPLOY_DIR}/data/airband_frequencies_full.json"
+else
+    echo "Note: data/airband_frequencies_full.json is not present; Airband channel listing will report data unavailable."
+fi
 
 scp "${TEMP_CONFIG}" \
     "${PI_USER}@${PI_HOST}:${PI_DEPLOY_DIR}/config.env"
