@@ -84,6 +84,15 @@ td { font-size: 13px; }
   pointer-events: none;
 }
 .aircraft-icon-wrap:hover .aircraft-icon-label { display: block; }
+.trail-hover-label {
+  background: rgba(8,16,29,.92);
+  border: 1px solid #526273;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: bold;
+  padding: 3px 6px;
+}
+.trail-hover-label::before { border-top-color: #526273; }
 @media (max-width: 950px) {
   .layout { grid-template-columns: 1fr; }
   .settings-grid { grid-template-columns: 1fr 1fr; }
@@ -412,6 +421,18 @@ function addTrailSegment(key, prior, current) {
     [[prior.lat, prior.lon], [current.lat, current.lon]],
     {color: trailColor(current.altitude), weight: 3, opacity: 0.86}
   ).addTo(aircraftMap);
+
+  const flight = String(current.flight || prior.flight || '').trim();
+  const identifier = flight || String(current.hex || prior.hex || key || '').toUpperCase();
+  if (identifier) {
+    segment.bindTooltip(escapeHtml(identifier), {
+      sticky: true,
+      direction: 'top',
+      opacity: 0.94,
+      className: 'trail-hover-label'
+    });
+  }
+
   const segments = aircraftTrailSegments.get(key) || [];
   segments.push(segment);
   while (segments.length > 1440) aircraftMap.removeLayer(segments.shift());
@@ -432,11 +453,19 @@ function renderStoredTrails() {
     }
   }
 }
-function recordTrailPoint(key, point, altitude) {
+function recordTrailPoint(key, point, altitude, aircraft) {
   const points = aircraftTrailHistory.get(key) || [];
   const previous = points.length ? points[points.length - 1] : null;
   if (previous && previous.lat === point[0] && previous.lon === point[1]) return;
-  const current = {lat: point[0], lon: point[1], altitude: altitude, time: Date.now()};
+  const current = {
+    lat: point[0],
+    lon: point[1],
+    altitude: altitude,
+    time: Date.now(),
+    flight: aircraft && aircraft.flight ? String(aircraft.flight).trim() : '',
+    hex: aircraft && aircraft.hex ? String(aircraft.hex).toUpperCase() : String(key).toUpperCase(),
+    track: aircraft ? aircraft.track : null
+  };
   if (previous) addTrailSegment(key, previous, current);
   points.push(current);
   aircraftTrailHistory.set(key, points);
@@ -533,7 +562,7 @@ function updateAircraftMap(aircraftRecords) {
     visibleIds.add(key);
     const altitude = altitudeFeet(aircraft);
     const color = trailColor(altitude);
-    recordTrailPoint(key, point, altitude);
+    recordTrailPoint(key, point, altitude, aircraft);
 
     let marker = aircraftMapMarkers.get(key);
     if (!marker) {
