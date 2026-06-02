@@ -297,8 +297,7 @@ function setReceiverOnMap(location) {
   if (aircraftMapFirstFit) aircraftMap.setView(position, 10);
 }
 function aircraftMapIcon(aircraft) {
-  const altitude = altitudeFeet(aircraft);
-  const color = trailColor(altitude);
+  const color = '#9aa0a6';
   const track = Number.isFinite(Number(aircraft.track)) ? Number(aircraft.track) : 0;
   const flight = aircraft.flight ? String(aircraft.flight).trim() : '';
   const label = flight || String(aircraft.hex || '').toUpperCase();
