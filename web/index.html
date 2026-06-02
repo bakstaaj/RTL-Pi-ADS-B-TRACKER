@@ -151,6 +151,10 @@ body { padding: 0; }
 .busy-elapsed { color: var(--yellow); font-size: 13px; text-align: center; font-variant-numeric: tabular-nums; }
 @keyframes busy-spin { to { transform: rotate(360deg); } }
 
+
+.map-location-pick-active { cursor: crosshair !important; box-shadow: inset 0 0 0 3px #f2c35c; }
+.map-location-pick-active .leaflet-container { cursor: crosshair !important; }
+
 </style>
 </head>
 <body>
@@ -175,7 +179,7 @@ body { padding: 0; }
     <button id="stopLive" type="button" class="menu-hidden-control" disabled>Stop Listening</button>
     <button id="autoNoaa" type="button" class="menu-hidden-control">Scan and Listen</button>
   </div>
-  <div class="menu-section"><details><summary>Configuration</summary>
+  <div class="menu-section"><details id="configurationDetails"><summary>Configuration</summary>
     <p>Receiver location is required for nearby airband channel selection.</p>
     <div class="settings-grid">
       <label>Location Name<input id="locationName" type="text" placeholder="Houston Test Location"></label>
@@ -183,7 +187,9 @@ body { padding: 0; }
       <label>Longitude<input id="locationLongitude" type="number" step="0.000001"></label>
       <label>Radius Miles<input id="locationRadius" type="number" min="1" max="500" value="100"></label>
     </div>
-    <button id="saveLocation" type="button">Save Receiver Location</button><div id="locationMessage" class="message warning">Loading receiver location…</div>
+    <button id="saveLocation" type="button">Save Receiver Location</button>
+      <button id="pickLocationOnMap" type="button">Pick Location on Map</button>
+      <button id="cancelLocationPick" class="stop" type="button" disabled>Cancel Map Pick</button><div id="locationMessage" class="message warning">Loading receiver location…</div>
     <div class="diagnostic-block"><label class="inline-label">Browser Trail Retention<select id="trailRetention"><option value="15">15 minutes</option><option value="60" selected>1 hour</option><option value="240">4 hours</option><option value="0">Until cleared</option></select></label><button id="erasePiTrails" class="stop" type="button">Erase Pi History</button></div>
   </details></div>
   <div class="menu-section"><details><summary>Diagnostics</summary>
@@ -227,6 +233,8 @@ let aircraftMapMarkers = new Map();
 let aircraftLastPositions = new Map();
 let aircraftTrailSegments = new Map();
 let aircraftMapFirstFit = true;
+let receiverLocationPickActive = false;
+let receiverLocationPreview = null;
 const TRAIL_STORAGE_KEY = 'rtlPiAdsbTrailHistoryV1';
 const TRAIL_RETENTION_KEY = 'rtlPiAdsbTrailRetentionMinutes';
 const TRAIL_CLEARED_AT_KEY = 'rtlPiAdsbTrailClearedAtV1';
@@ -279,11 +287,82 @@ function initializeAircraftMap() {
     return;
   }
   aircraftMap = L.map('aircraftMap').setView([29.7604, -95.3698], 9);
-  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  
+  aircraftMap.on('click', finishReceiverLocationPick);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
   }).addTo(aircraftMap);
 }
+function setReceiverPreviewOnMap(latitude, longitude) {
+  if (!aircraftMap) return;
+  const position = [Number(latitude), Number(longitude)];
+  receiverLocationPreview = position;
+  if (!receiverMapMarker) {
+    receiverMapMarker = L.circleMarker(position, {
+      radius: 8, color: '#f2c35c', weight: 3, fillColor: '#2778d4', fillOpacity: 0.95
+    }).addTo(aircraftMap).bindPopup('');
+  } else {
+    receiverMapMarker.setLatLng(position);
+    if (receiverMapMarker.setStyle) receiverMapMarker.setStyle({color: '#f2c35c', weight: 3});
+  }
+  receiverMapMarker.setPopupContent(
+    `<strong>Receiver Location Preview</strong><br>${position[0].toFixed(6)}, ${position[1].toFixed(6)}<br>Click Save Receiver Location to confirm.`
+  );
+  receiverMapMarker.openPopup();
+}
+function beginReceiverLocationPick() {
+  if (!aircraftMap) {
+    setMessage('locationMessage', 'Map is not available for location selection.', 'error');
+    return;
+  }
+  receiverLocationPickActive = true;
+  el('pickLocationOnMap').disabled = true;
+  el('cancelLocationPick').disabled = false;
+  el('aircraftMap').classList.add('map-location-pick-active');
+  if (typeof closeMenu === 'function') closeMenu();
+  setMessage(
+    'mapMessage',
+    'Location selection active: click the map at the physical antenna location.',
+    'warning'
+  );
+}
+function finishReceiverLocationPick(event) {
+  if (!receiverLocationPickActive) return;
+  const latitude = Number(event.latlng.lat);
+  const longitude = Number(event.latlng.lng);
+
+  el('locationLatitude').value = latitude.toFixed(6);
+  el('locationLongitude').value = longitude.toFixed(6);
+  if (el('locationName')) el('locationName').dataset.edited = 'true';
+  setReceiverPreviewOnMap(latitude, longitude);
+
+  receiverLocationPickActive = false;
+  el('pickLocationOnMap').disabled = false;
+  el('cancelLocationPick').disabled = true;
+  el('aircraftMap').classList.remove('map-location-pick-active');
+
+  if (typeof openMenu === 'function') openMenu();
+  const pickerButton = el('pickLocationOnMap');
+  const settings = el('configurationDetails') || (pickerButton ? pickerButton.closest('details') : null);
+  if (settings) settings.open = true;
+
+  setMessage(
+    'locationMessage',
+    `Map selection preview: ${latitude.toFixed(6)}, ${longitude.toFixed(6)}. Click Save Receiver Location to confirm.`,
+    'warning'
+  );
+  setMessage('mapMessage', 'Receiver location preview selected. Save it from Configuration to apply.', 'warning');
+}
+function cancelReceiverLocationPick() {
+  receiverLocationPickActive = false;
+  el('pickLocationOnMap').disabled = false;
+  el('cancelLocationPick').disabled = true;
+  el('aircraftMap').classList.remove('map-location-pick-active');
+  setMessage('locationMessage', 'Map location selection cancelled. Saved receiver location is unchanged.', '');
+  setMessage('mapMessage', 'Map location selection cancelled.', '');
+}
+
 function setReceiverOnMap(location) {
   if (!aircraftMap || !location) return;
   const position = [Number(location.latitude), Number(location.longitude)];
@@ -297,6 +376,10 @@ function setReceiverOnMap(location) {
   }
   receiverMapMarker.setPopupContent(`<strong>Receiver</strong><br>${escapeHtml(location.name || '')}<br>${position[0].toFixed(5)}, ${position[1].toFixed(5)}`);
   if (aircraftMapFirstFit) aircraftMap.setView(position, 10);
+  if (receiverMapMarker && receiverMapMarker.setStyle) {
+    receiverMapMarker.setStyle({color: '#ffffff', weight: 2});
+  }
+  receiverLocationPreview = null;
 }
 function aircraftMapIcon(aircraft) {
   const color = '#5f6670';
@@ -1222,6 +1305,8 @@ async function startDefaultBackgroundAirband() {
 }
 
 function bindControls() {
+  el('pickLocationOnMap').addEventListener('click', beginReceiverLocationPick);
+  el('cancelLocationPick').addEventListener('click', cancelReceiverLocationPick);
   el('menuToggle').addEventListener('click', toggleMenu);
   el('menuBackdrop').addEventListener('click', closeMenu);
   el('noaaMenuToggle').addEventListener('click', toggleNoaaMenuOperation);
