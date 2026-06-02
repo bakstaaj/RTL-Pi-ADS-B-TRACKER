@@ -577,7 +577,7 @@ function fitAircraftMap() {
 function centerReceiverMap() {
   if (aircraftMap && receiverMapLocation) aircraftMap.setView(receiverMapLocation, 10);
 }
-function clearAircraftTrails() {
+async function clearAircraftTrails() {
   if (!aircraftMap) return;
 
   removeTrailLayers();
@@ -588,11 +588,25 @@ function clearAircraftTrails() {
   localStorage.setItem(TRAIL_CLEARED_AT_KEY, String(aircraftTrailClearedAt));
   localStorage.removeItem(TRAIL_STORAGE_KEY);
 
-  setMessage(
-    'mapMessage',
-    'Stored aircraft trails cleared. Only movement received after this clear will build new trails.',
-    'good'
-  );
+  setMessage('mapMessage', 'Clearing browser and Pi-stored aircraft trails...', 'warning');
+  try {
+    const response = await fetch('/api/trails/clear', {method: 'POST', cache: 'no-store'});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    aircraftTrailClearedAt = Number(result.cleared_utc_ms || aircraftTrailClearedAt);
+    localStorage.setItem(TRAIL_CLEARED_AT_KEY, String(aircraftTrailClearedAt));
+    setMessage(
+      'mapMessage',
+      'Browser and Pi-stored trails cleared. Only post-clear movement will be retained.',
+      'good'
+    );
+  } catch (error) {
+    setMessage(
+      'mapMessage',
+      `Browser trails cleared, but Pi history clear failed: ${error.message}`,
+      'error'
+    );
+  }
 }
 
 function updateAudioButtons(status) {

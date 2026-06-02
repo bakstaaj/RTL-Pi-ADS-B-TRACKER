@@ -14,6 +14,10 @@ TRAIL_HISTORY_PATH = Path(os.environ.get(
     "RTL_PI_TRAIL_HISTORY_PATH",
     "/opt/rtl-pi-adsb-tracker/settings/aircraft_trails_history.json",
 ))
+TRAIL_CONTROL_PATH = Path(os.environ.get(
+    "RTL_PI_TRAIL_CONTROL_PATH",
+    "/opt/rtl-pi-adsb-tracker/settings/aircraft_trails_control.json",
+))
 SAMPLE_SECONDS = float(os.environ.get("RTL_PI_TRAIL_SAMPLE_SECONDS", "2"))
 RETENTION_MINUTES = int(os.environ.get("RTL_PI_TRAIL_RETENTION_MINUTES", "240"))
 MAX_POINTS_PER_AIRCRAFT = int(os.environ.get("RTL_PI_TRAIL_MAX_POINTS_PER_AIRCRAFT", "7200"))
@@ -37,6 +41,13 @@ def altitude_feet(aircraft: dict):
     except (TypeError, ValueError):
         return None
 
+def clear_watermark_ms() -> int:
+    data = read_json(TRAIL_CONTROL_PATH)
+    try:
+        return int(data.get("cleared_utc_ms", 0))
+    except (TypeError, ValueError):
+        return 0
+
 def load_history() -> dict:
     data = read_json(TRAIL_HISTORY_PATH)
     trails = data.get("trails", {})
@@ -48,6 +59,7 @@ def write_history(trails: dict) -> None:
         "updated_utc": int(time.time()),
         "retention_minutes": RETENTION_MINUTES,
         "source": "readsb_pi_background_collector",
+        "cleared_utc_ms": clear_watermark_ms(),
         "trails": trails,
     }
     temporary = TRAIL_HISTORY_PATH.with_suffix(".json.tmp")
@@ -72,11 +84,16 @@ def prune_history(trails: dict, now_ms: int) -> None:
     for key in remove:
         trails.pop(key, None)
 
-def collect_once(trails: dict) -> None:
+def collect_once(trails: dict, applied_clear_ms: int) -> int:
+    current_clear_ms = clear_watermark_ms()
+    if current_clear_ms > applied_clear_ms:
+        trails.clear()
+        applied_clear_ms = current_clear_ms
+
     data = read_json(AIRCRAFT_JSON_PATH)
     aircraft_list = data.get("aircraft", [])
     if not isinstance(aircraft_list, list):
-        return
+        return applied_clear_ms
 
     now_ms = int(time.time() * 1000)
     for aircraft in aircraft_list:
@@ -107,11 +124,13 @@ def collect_once(trails: dict) -> None:
 
     prune_history(trails, now_ms)
     write_history(trails)
+    return applied_clear_ms
 
 def main() -> int:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
     trails = load_history()
+    applied_clear_ms = clear_watermark_ms()
 
     print("RTL Pi ADS-B background trail collector")
     print(f"  readsb source:       {AIRCRAFT_JSON_PATH}")
@@ -121,7 +140,7 @@ def main() -> int:
     print(f"  max points/aircraft: {MAX_POINTS_PER_AIRCRAFT}", flush=True)
 
     while running:
-        collect_once(trails)
+        applied_clear_ms = collect_once(trails, applied_clear_ms)
         deadline = time.monotonic() + SAMPLE_SECONDS
         while running and time.monotonic() < deadline:
             time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))

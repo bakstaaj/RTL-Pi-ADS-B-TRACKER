@@ -19,6 +19,7 @@ sed "s|@DEPLOY_DIR@|${PI_DEPLOY_DIR}|g" \
 cat > "${TMP_DIR}/trail_collector.env" <<EOF
 RTL_PI_READSB_AIRCRAFT_JSON=${PI_READSB_JSON_DIR}/aircraft.json
 RTL_PI_TRAIL_HISTORY_PATH=${PI_DEPLOY_DIR}/settings/aircraft_trails_history.json
+RTL_PI_TRAIL_CONTROL_PATH=${PI_DEPLOY_DIR}/settings/aircraft_trails_control.json
 RTL_PI_TRAIL_SAMPLE_SECONDS=2
 RTL_PI_TRAIL_RETENTION_MINUTES=240
 RTL_PI_TRAIL_MAX_POINTS_PER_AIRCRAFT=7200
@@ -38,6 +39,7 @@ ssh -t "${PI_USER}@${PI_HOST}" "
     sudo install -m 0644 /tmp/rtl-pi-trail-collector-upload/rtl-pi-trail-collector.service /etc/systemd/system/rtl-pi-trail-collector.service
     sudo chown -R pi:pi '${PI_DEPLOY_DIR}/settings'
     sudo systemctl daemon-reload
-    sudo systemctl enable --now rtl-pi-trail-collector.service
+    sudo systemctl enable rtl-pi-trail-collector.service
+    sudo systemctl restart rtl-pi-trail-collector.service
     sudo systemctl --no-pager --full status rtl-pi-trail-collector.service | sed -n '1,14p'
 "

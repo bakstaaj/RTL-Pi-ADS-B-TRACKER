@@ -24,6 +24,7 @@ OUTPUT_DIR = ROOT / "test_output"
 SETTINGS_DIR = ROOT / "settings"
 RECEIVER_LOCATION_PATH = SETTINGS_DIR / "receiver_location.json"
 TRAIL_HISTORY_PATH = SETTINGS_DIR / "aircraft_trails_history.json"
+TRAIL_CONTROL_PATH = SETTINGS_DIR / "aircraft_trails_control.json"
 DATA_DIR = ROOT / "data"
 AIRBAND_DATA_PATH = DATA_DIR / "airband_frequencies_full.json"
 READSB_JSON_DIR = Path(os.environ.get("RTL_PI_READSB_JSON_DIR", "/run/rtl-pi-readsb"))
@@ -572,6 +573,37 @@ def airband_test_worker(channels: list[dict]) -> None:
         airband_test_thread = None
 
 
+def clear_pi_trail_history() -> dict:
+    cleared_utc_ms = int(time.time() * 1000)
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    control = {
+        "cleared_utc_ms": cleared_utc_ms,
+        "cleared_utc": int(time.time()),
+    }
+    empty_history = {
+        "updated_utc": int(time.time()),
+        "retention_minutes": 240,
+        "source": "readsb_pi_background_collector",
+        "cleared_utc_ms": cleared_utc_ms,
+        "trails": {},
+    }
+
+    control_temp = TRAIL_CONTROL_PATH.with_suffix(".json.tmp")
+    control_temp.write_text(json.dumps(control, indent=2) + "\n", encoding="utf-8")
+    control_temp.replace(TRAIL_CONTROL_PATH)
+
+    history_temp = TRAIL_HISTORY_PATH.with_suffix(".json.tmp")
+    history_temp.write_text(json.dumps(empty_history, separators=(",", ":")) + "\n", encoding="utf-8")
+    history_temp.replace(TRAIL_HISTORY_PATH)
+
+    return {
+        "cleared": True,
+        "cleared_utc_ms": cleared_utc_ms,
+        "message": "Pi-stored trail history cleared. New post-clear movement will be collected.",
+    }
+
+
 def safe_unlink(path: Path) -> None:
     try:
         path.unlink()
@@ -1075,6 +1107,10 @@ class Handler(BaseHTTPRequestHandler):
             self.command_airband_test_mode("resume")
             return
 
+
+        if request.path == "/api/trails/clear":
+            self.send_json(clear_pi_trail_history())
+            return
 
         if request.path == "/api/settings/receiver":
             payload = self.read_request_json()
