@@ -1197,6 +1197,7 @@ async function rescanSavedNoaaChannel() {
   operationTransitionActive = true;
   setOperationButtonsDisabled(true);
   airbandRestartSuspended = true;
+  closeMenu();
 
   try {
     const status = await jsonRequest('/api/status');
@@ -1630,6 +1631,7 @@ async function toggleNoaaMenuOperation() {
       return;
     }
 
+    closeMenu();
     airbandRestartSuspended = true;
     const airband = await readAirbandStatus();
     airbandPausedForNoaa = airbandBackgroundWanted || Boolean(airband.airband_scan_running);
@@ -1686,6 +1688,7 @@ async function toggleAirbandMenuOperation() {
       return;
     }
 
+    closeMenu();
     const status = await jsonRequest('/api/status');
     if (status.live_audio_running || liveListening) {
       await showBusyAndPaint('Stopping NOAA Weather…', 'Releasing the shared receiver for Airband scanning.');
