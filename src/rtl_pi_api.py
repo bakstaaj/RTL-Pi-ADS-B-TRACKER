@@ -164,6 +164,32 @@ def save_receiver_location(location: dict) -> None:
     clear_saved_noaa_selection()
 
 
+def save_airband_radius_only(radius_miles: float) -> dict | None:
+    location = read_receiver_location()
+    if location is None:
+        return None
+
+    updated = dict(location)
+    updated["airband_radius_miles"] = float(radius_miles)
+    updated["updated_utc"] = int(time.time())
+
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    location_temporary = RECEIVER_LOCATION_PATH.with_suffix(".json.tmp")
+    location_temporary.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
+    location_temporary.replace(RECEIVER_LOCATION_PATH)
+
+    # Radius affects only Airband frequency selection. Keep a valid NOAA
+    # selection by advancing its stored receiver-location cache key.
+    saved_noaa = read_json(NOAA_SELECTION_PATH)
+    if isinstance(saved_noaa, dict) and saved_noaa.get("frequency_hz") is not None:
+        saved_noaa["receiver_location_key"] = receiver_location_cache_key(updated)
+        noaa_temporary = NOAA_SELECTION_PATH.with_suffix(".json.tmp")
+        noaa_temporary.write_text(json.dumps(saved_noaa, indent=2) + "\n", encoding="utf-8")
+        noaa_temporary.replace(NOAA_SELECTION_PATH)
+
+    return updated
+
+
 def receiver_location_cache_key(location: dict | None) -> dict | None:
     if location is None:
         return None
@@ -1426,6 +1452,30 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "Enter a valid AirLabs API key before saving."}, HTTPStatus.BAD_REQUEST)
                 return
             self.send_json(save_airlabs_diagnostic_key(api_key))
+            return
+
+        if request.path == "/api/settings/airband-radius":
+            payload = self.read_request_json()
+            if payload is None:
+                self.send_json({"error": "A JSON Airband radius body is required."}, HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                radius_miles = float(payload.get("airband_radius_miles"))
+            except (TypeError, ValueError):
+                self.send_json({"error": "Airband radius must be numeric."}, HTTPStatus.BAD_REQUEST)
+                return
+            if radius_miles <= 0.0 or radius_miles > 500.0:
+                self.send_json({"error": "Airband radius must be greater than 0 and no more than 500 miles."}, HTTPStatus.BAD_REQUEST)
+                return
+            updated_location = save_airband_radius_only(radius_miles)
+            if updated_location is None:
+                self.send_json({"error": "Set the receiver location before changing Airband scan radius."}, HTTPStatus.CONFLICT)
+                return
+            self.send_json({
+                "saved": True,
+                "receiver_location": updated_location,
+                "noaa_selection_preserved": read_saved_noaa_selection() is not None,
+            })
             return
 
         if request.path == "/api/settings/receiver":

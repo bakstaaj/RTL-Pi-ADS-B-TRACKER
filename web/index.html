@@ -267,9 +267,20 @@ body { padding: 0; }
       <label>Location Name<input id="locationName" type="text" placeholder="Houston Test Location"></label>
       <label>Latitude<input id="locationLatitude" type="number" step="0.000001"></label>
       <label>Longitude<input id="locationLongitude" type="number" step="0.000001"></label>
-      <label>Radius Miles<input id="locationRadius" type="number" min="1" max="500" value="100"></label>
+      
     </div>
     <button id="saveLocation" type="button">Save Receiver Location</button>
+    <div class="provider-config-card">
+      <h4>Airband Scan Radius</h4>
+      <p class="small">Limits nearby AM channels selected for background Airband scanning. Changing this setting does not reset the saved NOAA Weather channel.</p>
+      <div class="provider-key-row">
+        <label>Radius Miles
+          <input id="locationRadius" type="number" min="1" max="500" value="25" step="1">
+        </label>
+        <button id="saveAirbandRadius" type="button">Apply Scan Radius</button>
+      </div>
+      <div id="airbandRadiusMessage" class="message">Current Airband radius will be loaded from the saved receiver location.</div>
+    </div>
       <button id="rescanNoaaChannel" type="button">Rescan NOAA Channel</button>
       <div class="provider-config-card">
         <h4>Aircraft Route Lookup — AirLabs</h4>
@@ -982,6 +993,9 @@ function renderLocation(location) {
   setMessage('locationMessage',
     `Saved: ${location.name} (${Number(location.latitude).toFixed(6)}, ${Number(location.longitude).toFixed(6)}) · ${location.airband_radius_miles} mile radius.`,
     'good');
+  if (el('airbandRadiusMessage')) {
+    setMessage('airbandRadiusMessage', `Current Airband scan radius: ${Number(location.airband_radius_miles).toFixed(1)} miles.`, 'good');
+  }
   setReceiverOnMap(location);
 }
 
@@ -1341,6 +1355,61 @@ async function testAirlabsKey() {
     }
   } catch (error) {
     setMessage('airlabsMessage', `Route lookup test failed: ${error.message}`, 'error');
+  }
+}
+
+async function saveAirbandRadius() {
+  const radiusMiles = Number(el('locationRadius').value);
+  if (!Number.isFinite(radiusMiles) || radiusMiles <= 0 || radiusMiles > 500) {
+    setMessage('airbandRadiusMessage', 'Enter an Airband radius greater than 0 and no more than 500 miles.', 'error');
+    return;
+  }
+
+  const originalAirband = await readAirbandStatus();
+  const restartScan = Boolean(originalAirband.airband_scan_running) && airbandBackgroundWanted && !liveListening;
+
+  try {
+    if (restartScan) {
+      await showBusyAndPaint(
+        'Applying Airband scan radius…',
+        `Stopping background scan before rebuilding channels within ${radiusMiles.toFixed(1)} miles.`
+      );
+      airbandRestartSuspended = true;
+      const stopped = await stopAirbandBackground(false, false);
+      if (!stopped) throw new Error('Airband scanner did not release the receiver.');
+    }
+
+    const result = await jsonRequest('/api/settings/airband-radius', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({airband_radius_miles: radiusMiles})
+    });
+    renderLocation(result.receiver_location);
+    setMessage(
+      'airbandRadiusMessage',
+      `Airband scan radius set to ${Number(result.receiver_location.airband_radius_miles).toFixed(1)} miles. Saved NOAA selection preserved.`,
+      'good'
+    );
+
+    if (restartScan) {
+      airbandRestartSuspended = false;
+      await startAirbandBackground(false);
+      setMessage(
+        'airbandRadiusMessage',
+        `Airband scan radius set to ${Number(result.receiver_location.airband_radius_miles).toFixed(1)} miles; background scan restarted with nearby channels only.`,
+        'good'
+      );
+    }
+  } catch (error) {
+    setMessage('airbandRadiusMessage', `Airband radius update failed: ${error.message}`, 'error');
+    if (restartScan && airbandBackgroundWanted && !liveListening) {
+      airbandRestartSuspended = false;
+      await startAirbandBackground(false);
+    }
+  } finally {
+    airbandRestartSuspended = false;
+    hideBusy();
+    await refreshOperationMenu();
   }
 }
 
@@ -1973,6 +2042,7 @@ function bindControls() {
   el('capture10').addEventListener('click', captureNoaa);
   el('autoNoaa').addEventListener('click', autoNoaa);
   el('saveLocation').addEventListener('click', saveLocation);
+  el('saveAirbandRadius').addEventListener('click', saveAirbandRadius);
   el('saveAirlabsKey').addEventListener('click', saveAirlabsKey);
   el('clearAirlabsKey').addEventListener('click', clearAirlabsKey);
   el('testAirlabsKey').addEventListener('click', testAirlabsKey);
