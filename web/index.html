@@ -208,6 +208,17 @@ body { padding: 0; }
 .aircraft-detail-actions a:hover, .aircraft-detail-actions button:hover { background: #243a56; }
 .photo-source-note { margin-top: 8px; color: var(--muted); font-size: 11px; }
 
+
+#rangeRingLegend { width: 100%; color: var(--muted); padding: 0 3px 5px; }
+.range-ring-major-label {
+  background: rgba(8,16,29,.84);
+  border: 1px solid #47505a;
+  border-radius: 3px;
+  color: #aeb6bf;
+  font-size: 10px;
+  padding: 1px 4px;
+}
+
 </style>
 </head>
 <body>
@@ -253,7 +264,8 @@ body { padding: 0; }
   </details></div>
 </nav>
 <main class="focus-layout">
-  <section class="map-panel"><div class="map-toolbar"><button id="fitAircraftMap" type="button">Fit Aircraft</button><button id="centerReceiverMap" type="button">Center Receiver</button><button id="clearAircraftTrails" type="button">Clear Display</button><button id="loadPiTrails" type="button">Restore Pi History</button><div id="mapMessage" class="message">Waiting for aircraft positions from readsb.</div></div><div id="aircraftMap"></div><div class="trail-legend"><span><i class="legend-line" style="border-color:#39ff14"></i>&lt; 5,001 ft</span><span><i class="legend-line" style="border-color:#087830"></i>&lt; 10,001 ft</span><span><i class="legend-line" style="border-color:#39cfff"></i>&lt; 20,001 ft</span><span><i class="legend-line" style="border-color:#1851b5"></i>&lt; 30,001 ft</span><span><i class="legend-line" style="border-color:#d4a600"></i>&lt; 40,001 ft</span><span><i class="legend-line" style="border-color:#ff3030"></i>&gt; 40,000 ft</span></div></section>
+  <section class="map-panel"><div class="map-toolbar"><button id="fitAircraftMap" type="button">Fit Aircraft</button><button id="centerReceiverMap" type="button">Center Receiver</button><button id="clearAircraftTrails" type="button">Clear Display</button><button id="loadPiTrails" type="button">Restore Pi History</button><div id="mapMessage" class="message">Waiting for aircraft positions from readsb.</div>
+      <div id="rangeRingLegend" class="small">Range rings: thin every 5 mi · heavier every 25 mi · outer ring 100 mi</div></div><div id="aircraftMap"></div><div class="trail-legend"><span><i class="legend-line" style="border-color:#39ff14"></i>&lt; 5,001 ft</span><span><i class="legend-line" style="border-color:#087830"></i>&lt; 10,001 ft</span><span><i class="legend-line" style="border-color:#39cfff"></i>&lt; 20,001 ft</span><span><i class="legend-line" style="border-color:#1851b5"></i>&lt; 30,001 ft</span><span><i class="legend-line" style="border-color:#d4a600"></i>&lt; 40,001 ft</span><span><i class="legend-line" style="border-color:#ff3030"></i>&gt; 40,000 ft</span></div></section>
   <section class="active-panel"><h2>Active Aircraft</h2><table><thead><tr><th>Flight / ICAO</th><th>Altitude</th><th>Speed</th><th>Seen</th></tr></thead><tbody id="aircraftRows"><tr><td colspan="4" class="empty">Loading aircraft data…</td></tr></tbody></table><div class="small">Click an aircraft on the map for details. Trails use altitude colors.</div></section>
 </main>
 
@@ -317,6 +329,7 @@ let livePumpTimer = null;
 let airbandTestPlayedEventId = 0;
 let aircraftMap = null;
 let receiverMapMarker = null;
+let receiverRangeRings = null;
 let receiverMapLocation = null;
 let aircraftMapMarkers = new Map();
 let aircraftLastPositions = new Map();
@@ -399,6 +412,7 @@ function setReceiverPreviewOnMap(latitude, longitude) {
     `<strong>Receiver Location Preview</strong><br>${position[0].toFixed(6)}, ${position[1].toFixed(6)}<br>Click Save Receiver Location to confirm.`
   );
   receiverMapMarker.openPopup();
+  drawReceiverRangeRings(position);
 }
 function beginReceiverLocationPick() {
   if (!aircraftMap) {
@@ -452,6 +466,42 @@ function cancelReceiverLocationPick() {
   setMessage('mapMessage', 'Map location selection cancelled.', '');
 }
 
+function drawReceiverRangeRings(position) {
+  if (!aircraftMap || !position) return;
+  if (receiverRangeRings) aircraftMap.removeLayer(receiverRangeRings);
+  receiverRangeRings = L.layerGroup().addTo(aircraftMap);
+
+  const milesToMeters = 1609.344;
+  const center = [Number(position[0]), Number(position[1])];
+
+  for (let miles = 5; miles <= 100; miles += 5) {
+    const major = miles % 25 === 0;
+    L.circle(center, {
+      radius: miles * milesToMeters,
+      color: major ? '#3e4650' : '#343b44',
+      weight: major ? 2.0 : 0.75,
+      opacity: major ? 0.82 : 0.48,
+      fill: false,
+      interactive: false,
+      dashArray: major ? null : '3 5'
+    }).addTo(receiverRangeRings);
+
+    if (major) {
+      const labelPoint = L.latLng(center[0] + (miles / 69.0), center[1]);
+      L.marker(labelPoint, {
+        interactive: false,
+        keyboard: false,
+        icon: L.divIcon({
+          className: '',
+          html: `<div class="range-ring-major-label">${miles} mi</div>`,
+          iconSize: [45, 18],
+          iconAnchor: [22, 9]
+        })
+      }).addTo(receiverRangeRings);
+    }
+  }
+}
+
 function setReceiverOnMap(location) {
   if (!aircraftMap || !location) return;
   const position = [Number(location.latitude), Number(location.longitude)];
@@ -469,6 +519,7 @@ function setReceiverOnMap(location) {
     receiverMapMarker.setStyle({color: '#ffffff', weight: 2});
   }
   receiverLocationPreview = null;
+  drawReceiverRangeRings(position);
 }
 function aircraftMapIcon(aircraft) {
   const color = '#5f6670';
