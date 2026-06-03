@@ -649,6 +649,20 @@ function removeTrailLayers() {
   }
   aircraftTrailSegments.clear();
 }
+function formatTrailLastSeen(timestamp) {
+  const milliseconds = Number(timestamp);
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return 'Unknown';
+  return new Intl.DateTimeFormat([], {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    second: '2-digit',
+    timeZoneName: 'short'
+  }).format(new Date(milliseconds));
+}
+
 function addTrailSegment(key, prior, current) {
   const segment = L.polyline(
     [[prior.lat, prior.lon], [current.lat, current.lon]],
@@ -657,8 +671,13 @@ function addTrailSegment(key, prior, current) {
 
   const flight = String(current.flight || prior.flight || '').trim();
   const identifier = flight || String(current.hex || prior.hex || key || '').toUpperCase();
+  const identifierLabel = flight ? 'Flight' : 'Aircraft';
+  const lastSeen = formatTrailLastSeen(current.time || prior.time);
   if (identifier) {
-    segment.bindTooltip(escapeHtml(identifier), {
+    const tooltipHtml =
+      `<strong>${identifierLabel}: ${escapeHtml(identifier)}</strong><br>` +
+      `Last Seen: ${escapeHtml(lastSeen)}`;
+    segment.bindTooltip(tooltipHtml, {
       sticky: true,
       direction: 'top',
       opacity: 0.94,
