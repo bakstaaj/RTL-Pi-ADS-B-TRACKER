@@ -252,6 +252,7 @@ body { padding: 0; }
       <label>Radius Miles<input id="locationRadius" type="number" min="1" max="500" value="100"></label>
     </div>
     <button id="saveLocation" type="button">Save Receiver Location</button>
+      <button id="rescanNoaaChannel" type="button">Rescan NOAA Channel</button>
       <button id="pickLocationOnMap" type="button">Pick Location on Map</button>
       <button id="cancelLocationPick" class="stop" type="button" disabled>Cancel Map Pick</button><div id="locationMessage" class="message warning">Loading receiver location…</div>
     <div class="diagnostic-block"><label class="inline-label">Browser Trail Retention<select id="trailRetention"><option value="15">15 minutes</option><option value="60" selected>1 hour</option><option value="240">4 hours</option><option value="0">Until cleared</option></select></label><button id="erasePiTrails" class="stop" type="button">Erase Pi History</button></div>
@@ -1191,6 +1192,44 @@ async function pumpLiveAudio() {
   }
 }
 
+async function rescanSavedNoaaChannel() {
+  if (operationTransitionActive) return;
+  operationTransitionActive = true;
+  setOperationButtonsDisabled(true);
+  airbandRestartSuspended = true;
+
+  try {
+    const status = await jsonRequest('/api/status');
+    const airband = await readAirbandStatus();
+
+    await showBusyAndPaint(
+      'Rescanning NOAA Weather channels…',
+      'Clearing the saved local channel and surveying all NOAA frequencies.'
+    );
+
+    if (status.live_audio_running || liveListening) {
+      await stopLive();
+    }
+    if (airband.airband_scan_running) {
+      const released = await stopAirbandBackground(false, false);
+      if (!released) throw new Error('Airband did not release the shared receiver.');
+    }
+
+    await autoNoaa(true);
+    await hideBusyAfterMinimum(550);
+    setMessage('locationMessage', 'NOAA local channel rescanned and saved for the current receiver location.', 'good');
+  } catch (error) {
+    hideBusy();
+    airbandRestartSuspended = false;
+    setMessage('locationMessage', `NOAA rescan failed: ${error.message}`, 'error');
+    if (airbandBackgroundWanted && !liveListening) await startAirbandBackground(true);
+  } finally {
+    operationTransitionActive = false;
+    setOperationButtonsDisabled(false);
+    await refreshOperationMenu();
+  }
+}
+
 async function startLive() {
   try {
     await jsonRequest('/api/noaa/live/start', {method: 'POST'});
@@ -1219,10 +1258,16 @@ async function stopLive() {
   await updateStatus();
 }
 
-async function autoNoaa() {
-  setMessage('surveyResult', 'Scanning all seven NOAA channels…', 'warning');
+async function autoNoaa(forceRescan = false) {
+  const noaaEndpoint = forceRescan ? '/api/noaa/auto/rescan' : '/api/noaa/auto/start';
+  setMessage(
+    'surveyResult',
+    forceRescan ? 'Rescanning all seven NOAA channels…' : 'Starting saved local NOAA channel, or surveying if none is saved…',
+    'warning'
+  );
+
   try {
-    const status = await jsonRequest('/api/noaa/auto/start', {method: 'POST'});
+    const status = await jsonRequest(noaaEndpoint, {method: 'POST'});
     liveAudioContext = new (window.AudioContext || window.webkitAudioContext)();
     await liveAudioContext.resume();
     liveListening = true;
@@ -1230,11 +1275,13 @@ async function autoNoaa() {
     liveNextPlayTime = liveAudioContext.currentTime + 0.20;
     const selected = (Number(status.noaa_frequency_hz) / 1000000).toFixed(3);
     setMessage('surveyResult', `Selected ${selected} MHz and started live listening.`, 'good');
-    setMessage('audioMessage', `NOAA Auto Select locked on ${selected} MHz.`, 'good');
+    setMessage('audioMessage', `NOAA listening active on ${selected} MHz.`, 'good');
     pumpLiveAudio();
     await updateStatus();
+    return status;
   } catch (error) {
-    setMessage('surveyResult', `Auto Select failed: ${error.message}`, 'error');
+    setMessage('surveyResult', `NOAA start failed: ${error.message}`, 'error');
+    throw error;
   }
 }
 
@@ -1476,6 +1523,20 @@ async function waitForAirbandStopped(timeoutMilliseconds = 15000) {
   }
   return false;
 }
+async function waitForNoaaRunning(timeoutMilliseconds = 12000) {
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (Date.now() < deadline) {
+    const status = await jsonRequest('/api/status');
+    if (status.live_audio_running) return status;
+    updateBusy(
+      'Starting NOAA Weather audio…',
+      'The local NOAA channel has been selected. Waiting for live audio buffering to begin.'
+    );
+    await delay(250);
+  }
+  return null;
+}
+
 async function refreshOperationMenu() {
   try {
     const status = await jsonRequest('/api/status');
@@ -1490,7 +1551,7 @@ async function refreshOperationMenu() {
 
     if (operationTransitionActive) return;
     if (noaaActive) {
-      setMessage('operationsMessage', 'NOAA Weather listening active. Background Airband scan is paused while the audio receiver is in use.', 'good');
+      setMessage('operationsMessage', 'NOAA Weather listening active. Background Airband scan is paused while receiver 00000162 is in use.', 'good');
     } else if (airbandActive) {
       setMessage('operationsMessage', 'Airband background scan active. It is silent unless real RF activity is detected. Use Diagnostics > Airband Scanner Test Mode for audible simulated audio.', 'warning');
     } else if (airbandBackgroundWanted) {
@@ -1589,10 +1650,14 @@ async function toggleNoaaMenuOperation() {
     );
     await autoNoaa();
 
-    const started = await jsonRequest('/api/status');
-    if (!started.live_audio_running && !liveListening) {
-      throw new Error('NOAA live audio did not start.');
+    const started = await waitForNoaaRunning();
+    if (!started) {
+      throw new Error('NOAA live audio did not report running within 12 seconds.');
     }
+    updateBusy(
+      'NOAA Weather listening active',
+      `Tuned to ${(Number(started.noaa_frequency_hz) / 1000000).toFixed(3)} MHz.`
+    );
     await hideBusyAfterMinimum(550);
   } catch (error) {
     hideBusy();
@@ -1662,6 +1727,7 @@ function bindControls() {
   el('capture10').addEventListener('click', captureNoaa);
   el('autoNoaa').addEventListener('click', autoNoaa);
   el('saveLocation').addEventListener('click', saveLocation);
+  el('rescanNoaaChannel').addEventListener('click', rescanSavedNoaaChannel);
   el('loadAirbandChannels').addEventListener('click', loadAirbandChannels);
   el('activityScanStart').addEventListener('click', startExperimentalScan);
   el('activityScanStop').addEventListener('click', stopExperimentalScan);

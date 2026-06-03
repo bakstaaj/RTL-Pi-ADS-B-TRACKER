@@ -23,6 +23,7 @@ WEB_ROOT = ROOT / "web"
 OUTPUT_DIR = ROOT / "test_output"
 SETTINGS_DIR = ROOT / "settings"
 RECEIVER_LOCATION_PATH = SETTINGS_DIR / "receiver_location.json"
+NOAA_SELECTION_PATH = SETTINGS_DIR / "selected_noaa_channel.json"
 TRAIL_HISTORY_PATH = SETTINGS_DIR / "aircraft_trails_history.json"
 TRAIL_CONTROL_PATH = SETTINGS_DIR / "aircraft_trails_control.json"
 DATA_DIR = ROOT / "data"
@@ -153,6 +154,57 @@ def save_receiver_location(location: dict) -> None:
     temporary_path = RECEIVER_LOCATION_PATH.with_suffix(".json.tmp")
     temporary_path.write_text(json.dumps(location, indent=2) + "\n", encoding="utf-8")
     temporary_path.replace(RECEIVER_LOCATION_PATH)
+    # Changing or re-saving receiver location invalidates the local NOAA cache.
+    clear_saved_noaa_selection()
+
+
+def receiver_location_cache_key(location: dict | None) -> dict | None:
+    if location is None:
+        return None
+    return {
+        "latitude": round(float(location["latitude"]), 6),
+        "longitude": round(float(location["longitude"]), 6),
+        "airband_radius_miles": round(float(location["airband_radius_miles"]), 2),
+    }
+
+
+def read_saved_noaa_selection() -> dict | None:
+    saved = read_json(NOAA_SELECTION_PATH)
+    location = read_receiver_location()
+    if not saved or location is None:
+        return None
+    if saved.get("receiver_location_key") != receiver_location_cache_key(location):
+        return None
+    frequency_hz = saved.get("frequency_hz")
+    if not isinstance(frequency_hz, int) or frequency_hz <= 0:
+        return None
+    if not isinstance(saved.get("station"), str):
+        return None
+    return saved
+
+
+def save_noaa_selection(frequency_hz: int, station: str, survey: dict) -> None:
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    location = read_receiver_location()
+    if location is None:
+        return
+    selection = {
+        "frequency_hz": int(frequency_hz),
+        "station": station,
+        "receiver_location_key": receiver_location_cache_key(location),
+        "saved_utc": int(time.time()),
+        "survey": survey,
+    }
+    temporary_path = NOAA_SELECTION_PATH.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(selection, indent=2) + "\n", encoding="utf-8")
+    temporary_path.replace(NOAA_SELECTION_PATH)
+
+
+def clear_saved_noaa_selection() -> None:
+    try:
+        NOAA_SELECTION_PATH.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def first_present(record: dict, names: tuple[str, ...]) -> object | None:
@@ -651,6 +703,7 @@ def build_status() -> dict:
         live_running = refresh_live_process_locked()
         state = dict(runtime_state)
     receiver_location = read_receiver_location()
+    saved_noaa_selection = read_saved_noaa_selection()
     return {
         "service": "rtl-pi-api",
         "readsb_json_available": AIRCRAFT_JSON.exists(),
@@ -666,6 +719,9 @@ def build_status() -> dict:
         "noaa_frequency_hz": selected_noaa_frequency_hz,
         "configured_noaa_station": NOAA_STATION,
         "configured_noaa_frequency_hz": NOAA_FREQ_HZ,
+        "saved_noaa_selection_available": saved_noaa_selection is not None,
+        "saved_noaa_frequency_hz": saved_noaa_selection.get("frequency_hz") if saved_noaa_selection else None,
+        "saved_noaa_station": saved_noaa_selection.get("station") if saved_noaa_selection else None,
         "rf_gain_db": RF_GAIN_DB,
         "audio_output_gain": AUDIO_OUTPUT_GAIN,
         "receiver_location_configured": receiver_location is not None,
@@ -953,8 +1009,19 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             receiver_lock.release()
 
-    def auto_select_and_start_noaa(self) -> None:
+    def auto_select_and_start_noaa(self, force_rescan: bool = False) -> None:
         global selected_noaa_frequency_hz, selected_noaa_station
+
+        if not force_rescan:
+            saved_selection = read_saved_noaa_selection()
+            if saved_selection is not None:
+                selected_noaa_frequency_hz = int(saved_selection["frequency_hz"])
+                selected_noaa_station = str(saved_selection["station"])
+                with state_lock:
+                    runtime_state["last_noaa_survey"] = saved_selection.get("survey")
+                    runtime_state["last_noaa_survey_time"] = saved_selection.get("saved_utc")
+                self.start_live_noaa()
+                return
 
         if not receiver_lock.acquire(blocking=False):
             self.send_json(
@@ -979,7 +1046,7 @@ class Handler(BaseHTTPRequestHandler):
                 command,
                 text=True,
                 capture_output=True,
-                timeout=SURVEY_SECONDS * 7 + 20,
+                timeout=(SURVEY_SECONDS * 7) + 30,
                 check=False,
             )
             if result.returncode != 0 or not survey_path.exists():
@@ -992,7 +1059,7 @@ class Handler(BaseHTTPRequestHandler):
 
             survey = read_json(survey_path)
             best_frequency = survey.get("best_frequency_hz")
-            if not isinstance(best_frequency, int):
+            if not isinstance(best_frequency, int) or best_frequency <= 0:
                 self.send_json(
                     {"error": "NOAA survey did not report a valid best frequency."},
                     HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -1001,6 +1068,7 @@ class Handler(BaseHTTPRequestHandler):
 
             selected_noaa_frequency_hz = best_frequency
             selected_noaa_station = f"AUTO SELECT — {best_frequency / 1000000.0:.3f} MHz"
+            save_noaa_selection(selected_noaa_frequency_hz, selected_noaa_station, survey)
             with state_lock:
                 runtime_state["last_noaa_survey"] = survey
                 runtime_state["last_noaa_survey_time"] = int(time.time())
@@ -1162,6 +1230,10 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 HTTPStatus.NOT_IMPLEMENTED,
             )
+            return
+
+        if request.path == "/api/noaa/auto/rescan":
+            self.auto_select_and_start_noaa(force_rescan=True)
             return
 
         if request.path == "/api/noaa/auto/start":
