@@ -75,6 +75,12 @@ td { font-size: 13px; }
 .map-toolbar select { width: auto; margin-top: 0; padding: 8px; }
 .trail-legend { display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 12px; margin: 10px 0 2px; }
 .legend-line { display: inline-block; width: 21px; border-top: 4px solid; margin-right: 5px; vertical-align: middle; }
+.map-footer { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 10px 18px; margin: 10px 0 2px; }
+.map-footer .trail-legend { margin: 0; flex: 1 1 500px; }
+.map-footer-status { flex: 0 1 360px; text-align: right; color: var(--muted); font-size: 12px; line-height: 1.55; white-space: nowrap; }
+.map-footer-status .tuning-active { color: #d4a600; font-weight: 600; }
+.map-footer-status .tuning-paused { color: #72b5ff; }
+@media (max-width: 1050px) { .map-footer-status { flex-basis: 100%; text-align: left; white-space: normal; } }
 .aircraft-icon-wrap { position: relative; width: 46px; height: 42px; }
 .aircraft-icon-wrap svg { display: block; filter: drop-shadow(0 1px 2px #000); transform-origin: 20px 20px; }
 .aircraft-icon-label {
@@ -236,7 +242,7 @@ body { padding: 0; }
 <body>
 <header class="app-header">
   <button id="menuToggle" class="menu-button" type="button" aria-label="Open menu" aria-expanded="false">&#9776;</button>
-  <div class="app-title"><h1>RTL Pi ADS-B Tracker</h1><div class="subtitle" id="stationDetail">Loading receivers…</div></div>
+  <div class="app-title"><h1>RTL Pi ADS-B Tracker</h1></div>
   <div class="header-stats">
     <div class="header-stat"><div class="label">Messages</div><div class="value" id="messageCount">—</div></div>
     <div class="header-stat"><div class="label">Aircraft</div><div class="value" id="aircraftCount">—</div></div>
@@ -301,7 +307,7 @@ body { padding: 0; }
 </nav>
 <main class="focus-layout">
   <section class="map-panel"><div class="map-toolbar"><button id="fitAircraftMap" type="button">Fit Aircraft</button><button id="centerReceiverMap" type="button">Center Receiver</button><button id="clearAircraftTrails" type="button">Clear Display</button><button id="loadPiTrails" type="button">Restore Pi History</button><div id="mapMessage" class="message">Waiting for aircraft positions from readsb.</div>
-      <div id="rangeRingLegend" class="small">Range rings: thin every 5 mi · heavier every 25 mi · outer ring 100 mi</div></div><div id="aircraftMap"></div><div class="trail-legend"><span><i class="legend-line" style="border-color:#39ff14"></i>&lt; 5,001 ft</span><span><i class="legend-line" style="border-color:#087830"></i>&lt; 10,001 ft</span><span><i class="legend-line" style="border-color:#39cfff"></i>&lt; 20,001 ft</span><span><i class="legend-line" style="border-color:#1851b5"></i>&lt; 30,001 ft</span><span><i class="legend-line" style="border-color:#d4a600"></i>&lt; 40,001 ft</span><span><i class="legend-line" style="border-color:#ff3030"></i>&gt; 40,000 ft</span></div></section>
+      <div id="rangeRingLegend" class="small">Range rings: thin every 5 mi · heavier every 25 mi · outer ring 100 mi</div></div><div id="aircraftMap"></div><div class="map-footer"><div class="trail-legend"><span><i class="legend-line" style="border-color:#39ff14"></i>&lt; 5,001 ft</span><span><i class="legend-line" style="border-color:#087830"></i>&lt; 10,001 ft</span><span><i class="legend-line" style="border-color:#39cfff"></i>&lt; 20,001 ft</span><span><i class="legend-line" style="border-color:#1851b5"></i>&lt; 30,001 ft</span><span><i class="legend-line" style="border-color:#d4a600"></i>&lt; 40,001 ft</span><span><i class="legend-line" style="border-color:#ff3030"></i>&gt; 40,000 ft</span></div><div class="map-footer-status"><div id="stationDetail">Loading NOAA receiver information…</div><div id="airbandTuningDetail">Airband Tuning: loading…</div></div></div></section>
   <section class="active-panel"><h2>Active Aircraft</h2><table><thead><tr><th>Flight / ICAO</th><th>Altitude</th><th>Speed</th><th>Seen</th></tr></thead><tbody id="aircraftRows"><tr><td colspan="4" class="empty">Loading aircraft data…</td></tr></tbody></table><div class="small">Click an aircraft on the map for details. Trails use altitude colors.</div></section>
 </main>
 
@@ -984,7 +990,7 @@ async function updateStatus() {
     const status = await jsonRequest('/api/status');
     setText('stationName', status.noaa_station || 'NOAA Weather');
     setText('stationDetail',
-      `${(Number(status.noaa_frequency_hz) / 1000000).toFixed(3)} MHz NFM · Audio RTL-SDR ${status.audio_receiver_serial || ''}`);
+      `NOAA: ${(Number(status.noaa_frequency_hz) / 1000000).toFixed(3)} MHz NFM · Audio RTL-SDR S/N: ${status.audio_receiver_serial || '—'}`);
     setText('messageCount', formattedNumber(status.messages));
     setText('aircraftCount', formattedNumber(status.aircraft_count));
     setText('positionCount', formattedNumber(status.aircraft_with_position));
@@ -1747,12 +1753,40 @@ async function waitForNoaaRunning(timeoutMilliseconds = 12000) {
   return null;
 }
 
+function updateAirbandTuningDetail(airband, noaaActive) {
+  const target = el('airbandTuningDetail');
+  if (!target) return;
+
+  target.className = '';
+  if (noaaActive) {
+    target.textContent = 'Airband Tuning: paused while NOAA is active';
+    target.className = 'tuning-paused';
+    return;
+  }
+
+  if (!airband || !airband.airband_scan_running) {
+    target.textContent = 'Airband Tuning: stopped';
+    return;
+  }
+
+  const channel = airband.airband_current_channel;
+  if (channel && Number.isFinite(Number(channel.frequency_mhz))) {
+    const description = channel.use ? ` · ${channel.use}` : '';
+    target.textContent = `Airband Tuning: ${Number(channel.frequency_mhz).toFixed(3)} MHz AM${description}`;
+    target.className = 'tuning-active';
+  } else {
+    target.textContent = 'Airband Tuning: scanning…';
+    target.className = 'tuning-active';
+  }
+}
+
 async function refreshOperationMenu() {
   try {
     const status = await jsonRequest('/api/status');
     const airband = await readAirbandStatus();
     const noaaActive = Boolean(status.live_audio_running || liveListening);
     const airbandActive = Boolean(airband.airband_scan_running);
+    updateAirbandTuningDetail(airband, noaaActive);
 
     el('noaaMenuToggle').textContent = noaaActive ? 'Stop NOAA Weather' : 'Start NOAA Weather';
     el('noaaMenuToggle').className = noaaActive ? 'stop' : '';
