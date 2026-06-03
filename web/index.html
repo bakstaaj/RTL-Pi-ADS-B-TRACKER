@@ -478,9 +478,9 @@ function drawReceiverRangeRings(position) {
     const major = miles % 25 === 0;
     L.circle(center, {
       radius: miles * milesToMeters,
-      color: major ? '#3e4650' : '#343b44',
+      color: major ? '#3e4650' : '#1d232a',
       weight: major ? 2.0 : 0.75,
-      opacity: major ? 0.82 : 0.48,
+      opacity: major ? 0.82 : 0.62,
       fill: false,
       interactive: false,
       dashArray: major ? null : '3 5'
