@@ -663,6 +663,42 @@ function formatTrailLastSeen(timestamp) {
   }).format(new Date(milliseconds));
 }
 
+const trailRouteHoverCache = new Map();
+
+async function updateTrailTooltipRoute(segment, tooltipHeader, flight) {
+  const callsign = String(flight || '').trim().toUpperCase();
+  if (!callsign) return;
+
+  segment.setTooltipContent(`${tooltipHeader}<br>From / To: Looking up…`);
+
+  let routePromise = trailRouteHoverCache.get(callsign);
+  if (!routePromise) {
+    routePromise = requestAirlabsDiagnosticRoute(callsign);
+    trailRouteHoverCache.set(callsign, routePromise);
+  }
+
+  try {
+    const result = await routePromise;
+    if (!result.matched) {
+      trailRouteHoverCache.delete(callsign);
+      segment.setTooltipContent(
+        `${tooltipHeader}<br>From / To: Unavailable`
+      );
+      return;
+    }
+
+    const origin = escapeHtml(formatAirlabsAirport(result.departure_iata, result.departure_icao));
+    const destination = escapeHtml(formatAirlabsAirport(result.arrival_iata, result.arrival_icao));
+    const source = result.cache_hit ? 'AirLabs (cached)' : 'AirLabs';
+    segment.setTooltipContent(
+      `${tooltipHeader}<br>From: ${origin}<br>To: ${destination}<br>Source: ${source}`
+    );
+  } catch (error) {
+    trailRouteHoverCache.delete(callsign);
+    segment.setTooltipContent(`${tooltipHeader}<br>From / To: Lookup unavailable`);
+  }
+}
+
 function addTrailSegment(key, prior, current) {
   const segment = L.polyline(
     [[prior.lat, prior.lon], [current.lat, current.lon]],
@@ -674,15 +710,20 @@ function addTrailSegment(key, prior, current) {
   const identifierLabel = flight ? 'Flight' : 'Aircraft';
   const lastSeen = formatTrailLastSeen(current.time || prior.time);
   if (identifier) {
-    const tooltipHtml =
+    const tooltipHeader =
       `<strong>${identifierLabel}: ${escapeHtml(identifier)}</strong><br>` +
       `Last Seen: ${escapeHtml(lastSeen)}`;
+    const tooltipHtml = tooltipHeader +
+      (flight ? '<br>From / To: Hover to look up' : '<br>From / To: Unavailable without callsign');
     segment.bindTooltip(tooltipHtml, {
       sticky: true,
       direction: 'top',
       opacity: 0.94,
       className: 'trail-hover-label'
     });
+    if (flight) {
+      segment.on('tooltipopen', () => updateTrailTooltipRoute(segment, tooltipHeader, flight));
+    }
   }
 
   const segments = aircraftTrailSegments.get(key) || [];
