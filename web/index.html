@@ -284,6 +284,7 @@ body { padding: 0; }
             <input id="airlabsTestFlight" type="text" placeholder="Example: UAL1234">
           </label>
           <button id="testAirlabsKey" type="button">Test Route Lookup</button>
+          <button id="clearAirlabsRouteCache" class="stop" type="button">Clear Route Cache</button>
         </div>
         <div id="airlabsMessage" class="message">AirLabs configuration status loading…</div>
       </div>
@@ -1056,7 +1057,7 @@ async function applyAirlabsRouteToDetails(flight) {
     }
     detailValue('detailOrigin', formatAirlabsAirport(result.departure_iata, result.departure_icao));
     detailValue('detailDestination', formatAirlabsAirport(result.arrival_iata, result.arrival_icao));
-    detailValue('detailRouteSource', 'AirLabs Flight Information API');
+    detailValue('detailRouteSource', result.cache_hit ? 'AirLabs Flight Information API (cached)' : 'AirLabs Flight Information API');
     if (result.flight_iata) detailValue('detailFlight', `${callsign} / ${result.flight_iata}`);
   } catch (error) {
     detailValue('detailRouteSource', `AirLabs unavailable: ${error.message}`);
@@ -1198,7 +1199,7 @@ async function loadAirlabsSettings() {
     setMessage(
       'airlabsMessage',
       status.configured
-        ? `AirLabs route lookup configured (${status.key_hint}).`
+        ? `AirLabs route lookup configured (${status.key_hint}). Cached successful routes: ${status.route_cache_entries || 0}; expires after ${Math.round((status.cache_ttl_seconds || 7200) / 3600)} hours.`
         : 'AirLabs is not configured. Paste an API key and save it here.',
       status.configured ? 'good' : 'warning'
     );
@@ -1245,6 +1246,15 @@ function formatAirlabsAirport(iata, icao) {
 async function requestAirlabsDiagnosticRoute(flight) {
   return await jsonRequest(`/api/diagnostics/airlabs/route?flight=${encodeURIComponent(flight || '')}`);
 }
+async function clearAirlabsRouteCache() {
+  try {
+    await jsonRequest('/api/diagnostics/airlabs/cache/clear', {method: 'POST'});
+    setMessage('airlabsMessage', 'AirLabs successful-route cache cleared. The next popup lookup will query AirLabs again.', 'good');
+  } catch (error) {
+    setMessage('airlabsMessage', `AirLabs cache clear failed: ${error.message}`, 'error');
+  }
+}
+
 async function testAirlabsKey() {
   const flight = el('airlabsTestFlight').value.trim().toUpperCase();
   if (!flight) {
@@ -1257,7 +1267,7 @@ async function testAirlabsKey() {
     if (result.matched) {
       setMessage(
         'airlabsMessage',
-        `${flight}: ${formatAirlabsAirport(result.departure_iata, result.departure_icao)} → ${formatAirlabsAirport(result.arrival_iata, result.arrival_icao)}.`,
+        `${flight}: ${formatAirlabsAirport(result.departure_iata, result.departure_icao)} → ${formatAirlabsAirport(result.arrival_iata, result.arrival_icao)}.${result.cache_hit ? ' Cached result.' : ' Fresh AirLabs result cached for reuse.'}`,
         'good'
       );
     } else {
@@ -1872,6 +1882,7 @@ function bindControls() {
   el('saveAirlabsKey').addEventListener('click', saveAirlabsKey);
   el('clearAirlabsKey').addEventListener('click', clearAirlabsKey);
   el('testAirlabsKey').addEventListener('click', testAirlabsKey);
+  el('clearAirlabsRouteCache').addEventListener('click', clearAirlabsRouteCache);
   el('rescanNoaaChannel').addEventListener('click', rescanSavedNoaaChannel);
   el('loadAirbandChannels').addEventListener('click', loadAirbandChannels);
   el('activityScanStart').addEventListener('click', startExperimentalScan);

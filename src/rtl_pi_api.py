@@ -27,6 +27,8 @@ OUTPUT_DIR = ROOT / "test_output"
 SETTINGS_DIR = ROOT / "settings"
 RECEIVER_LOCATION_PATH = SETTINGS_DIR / "receiver_location.json"
 AIRLABS_DIAGNOSTIC_SETTINGS_PATH = SETTINGS_DIR / "airlabs_api.json"
+AIRLABS_ROUTE_CACHE_PATH = SETTINGS_DIR / "airlabs_route_cache.json"
+AIRLABS_ROUTE_CACHE_TTL_SECONDS = int(os.environ.get("RTL_PI_AIRLABS_ROUTE_CACHE_TTL_SECONDS", "7200"))
 NOAA_SELECTION_PATH = SETTINGS_DIR / "selected_noaa_channel.json"
 TRAIL_HISTORY_PATH = SETTINGS_DIR / "aircraft_trails_history.json"
 TRAIL_CONTROL_PATH = SETTINGS_DIR / "aircraft_trails_control.json"
@@ -226,6 +228,8 @@ def airlabs_diagnostic_status() -> dict:
         "configured": bool(key),
         "key_hint": ("Ending in " + key[-4:]) if key else None,
         "settings_file": AIRLABS_DIAGNOSTIC_SETTINGS_PATH.name,
+        "route_cache_entries": active_airlabs_route_cache_entries(),
+        "cache_ttl_seconds": AIRLABS_ROUTE_CACHE_TTL_SECONDS,
     }
 
 
@@ -252,6 +256,86 @@ def save_airlabs_diagnostic_key(api_key: str) -> dict:
     if not reread["configured"]:
         raise RuntimeError("AirLabs key was written but could not be read back.")
     return reread
+
+
+def read_airlabs_route_cache() -> dict:
+    cache = read_json(AIRLABS_ROUTE_CACHE_PATH)
+    if not isinstance(cache, dict):
+        return {"entries": {}}
+    entries = cache.get("entries")
+    if not isinstance(entries, dict):
+        return {"entries": {}}
+    return {"entries": entries}
+
+
+def active_airlabs_route_cache_entries() -> int:
+    now = int(time.time())
+    entries = read_airlabs_route_cache()["entries"]
+    return sum(
+        1 for entry in entries.values()
+        if isinstance(entry, dict)
+        and now - int(entry.get("cached_utc", 0)) < AIRLABS_ROUTE_CACHE_TTL_SECONDS
+    )
+
+
+def load_cached_airlabs_route(callsign: str) -> dict | None:
+    entry = read_airlabs_route_cache()["entries"].get(callsign)
+    if not isinstance(entry, dict):
+        return None
+    cached_utc = int(entry.get("cached_utc", 0))
+    age_seconds = max(0, int(time.time()) - cached_utc)
+    if age_seconds >= AIRLABS_ROUTE_CACHE_TTL_SECONDS:
+        return None
+    result = entry.get("result")
+    if not isinstance(result, dict) or not result.get("matched"):
+        return None
+    cached_result = dict(result)
+    cached_result.update({
+        "cache_hit": True,
+        "cache_age_seconds": age_seconds,
+        "cache_ttl_seconds": AIRLABS_ROUTE_CACHE_TTL_SECONDS,
+        "message": "Route fields returned from cache.",
+    })
+    return cached_result
+
+
+def save_cached_airlabs_route(callsign: str, result: dict) -> None:
+    if not result.get("matched"):
+        return
+    now = int(time.time())
+    entries = read_airlabs_route_cache()["entries"]
+    entries = {
+        key: value for key, value in entries.items()
+        if isinstance(value, dict)
+        and now - int(value.get("cached_utc", 0)) < AIRLABS_ROUTE_CACHE_TTL_SECONDS
+    }
+    stored_result = dict(result)
+    stored_result["cache_hit"] = False
+    stored_result["cache_age_seconds"] = 0
+    stored_result["cache_ttl_seconds"] = AIRLABS_ROUTE_CACHE_TTL_SECONDS
+    entries[callsign] = {"cached_utc": now, "result": stored_result}
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    temporary_path = AIRLABS_ROUTE_CACHE_PATH.with_suffix(".json.tmp")
+    temporary_path.write_text(
+        json.dumps({"entries": entries, "updated_utc": now}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.chmod(0o600)
+    temporary_path.replace(AIRLABS_ROUTE_CACHE_PATH)
+    AIRLABS_ROUTE_CACHE_PATH.chmod(0o600)
+
+
+def clear_airlabs_route_cache() -> dict:
+    try:
+        AIRLABS_ROUTE_CACHE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    return {
+        "provider": "AirLabs",
+        "cleared": True,
+        "route_cache_entries": 0,
+        "cache_ttl_seconds": AIRLABS_ROUTE_CACHE_TTL_SECONDS,
+    }
 
 
 def clean_airlabs_callsign(value: str) -> str:
@@ -281,6 +365,10 @@ def test_airlabs_route_diagnostic(flight: str) -> dict:
             "matched": False,
             "message": "Provide a commercial flight ICAO callsign, for example UAL1234.",
         }
+
+    cached_result = load_cached_airlabs_route(callsign)
+    if cached_result is not None:
+        return cached_result
 
     query = urllib.parse.urlencode({"flight_icao": callsign, "api_key": key})
     request_url = "https://airlabs.co/api/v9/flight?" + query
@@ -334,12 +422,18 @@ def test_airlabs_route_diagnostic(flight: str) -> dict:
         "status": record.get("status"),
     }
     matched = any(fields[name] for name in ("departure_iata", "departure_icao", "arrival_iata", "arrival_icao"))
-    return {
+    result = {
         **base,
         "matched": matched,
         **fields,
+        "cache_hit": False,
+        "cache_age_seconds": 0,
+        "cache_ttl_seconds": AIRLABS_ROUTE_CACHE_TTL_SECONDS,
         "message": "Route fields returned." if matched else f"AirLabs returned no origin/destination for {callsign}.",
     }
+    if matched:
+        save_cached_airlabs_route(callsign, result)
+    return result
 
 
 def first_present(record: dict, names: tuple[str, ...]) -> object | None:
@@ -1313,6 +1407,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if request.path == "/api/trails/clear":
             self.send_json(clear_pi_trail_history())
+            return
+
+        if request.path == "/api/diagnostics/airlabs/cache/clear":
+            self.send_json(clear_airlabs_route_cache())
             return
 
         if request.path == "/api/diagnostics/airlabs/settings":
