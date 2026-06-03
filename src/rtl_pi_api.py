@@ -229,6 +229,31 @@ def airlabs_diagnostic_status() -> dict:
     }
 
 
+def save_airlabs_diagnostic_key(api_key: str) -> dict:
+    key = str(api_key or "").strip()
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    if not key:
+        try:
+            AIRLABS_DIAGNOSTIC_SETTINGS_PATH.unlink()
+        except FileNotFoundError:
+            pass
+        return airlabs_diagnostic_status()
+
+    temporary_path = AIRLABS_DIAGNOSTIC_SETTINGS_PATH.with_suffix(".json.tmp")
+    temporary_path.write_text(
+        json.dumps({"api_key": key, "updated_utc": int(time.time())}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.chmod(0o600)
+    temporary_path.replace(AIRLABS_DIAGNOSTIC_SETTINGS_PATH)
+    AIRLABS_DIAGNOSTIC_SETTINGS_PATH.chmod(0o600)
+
+    reread = airlabs_diagnostic_status()
+    if not reread["configured"]:
+        raise RuntimeError("AirLabs key was written but could not be read back.")
+    return reread
+
+
 def clean_airlabs_callsign(value: str) -> str:
     return "".join(character for character in str(value or "").upper().strip() if character.isalnum())
 
@@ -1288,6 +1313,21 @@ class Handler(BaseHTTPRequestHandler):
 
         if request.path == "/api/trails/clear":
             self.send_json(clear_pi_trail_history())
+            return
+
+        if request.path == "/api/diagnostics/airlabs/settings":
+            payload = self.read_request_json()
+            if payload is None:
+                self.send_json({"error": "A JSON settings body is required."}, HTTPStatus.BAD_REQUEST)
+                return
+            if bool(payload.get("clear")):
+                self.send_json(save_airlabs_diagnostic_key(""))
+                return
+            api_key = str(payload.get("api_key", "")).strip()
+            if len(api_key) < 8:
+                self.send_json({"error": "Enter a valid AirLabs API key before saving."}, HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json(save_airlabs_diagnostic_key(api_key))
             return
 
         if request.path == "/api/settings/receiver":

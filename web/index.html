@@ -266,26 +266,26 @@ body { padding: 0; }
     <button id="saveLocation" type="button">Save Receiver Location</button>
       <button id="rescanNoaaChannel" type="button">Rescan NOAA Channel</button>
       <div class="provider-config-card">
-        <h4>Aircraft Route Lookup — AeroDataBox</h4>
+        <h4>Aircraft Route Lookup — AirLabs</h4>
         <div class="provider-link-row">
-          <a href="https://rapidapi.com/aedbx-aedbx/api/aerodatabox/pricing" target="_blank" rel="noopener noreferrer">Create RapidAPI Key / Basic Plan</a>
-          <a href="https://doc.aerodatabox.com/rapidapi.html" target="_blank" rel="noopener noreferrer">AeroDataBox Documentation</a>
+          <a href="https://airlabs.co/account" target="_blank" rel="noopener noreferrer">Manage AirLabs API Key</a>
+          <a href="https://airlabs.co/docs/flight" target="_blank" rel="noopener noreferrer">Flight API Documentation</a>
         </div>
-        <p class="small">Provides commercial-flight From/To lookup. The key is stored on the Pi only. Enter it only over your trusted local or USB network.</p>
+        <p class="small">Provides airline-flight From/To lookup. The key is stored only on this Pi. Enter or update it only over your trusted USB/private network.</p>
         <div class="provider-key-row">
-          <label>RapidAPI Key
-            <input id="aerodataboxApiKey" type="password" autocomplete="new-password" placeholder="Paste X-RapidAPI-Key">
+          <label>AirLabs API Key
+            <input id="airlabsApiKey" type="password" autocomplete="new-password" placeholder="Paste AirLabs API key">
           </label>
-          <button id="saveAerodataboxKey" type="button">Save Key</button>
-          <button id="clearAerodataboxKey" class="stop" type="button">Clear Key</button>
+          <button id="saveAirlabsKey" type="button">Save / Update Key</button>
+          <button id="clearAirlabsKey" class="stop" type="button">Clear Key</button>
         </div>
         <div class="provider-test-row">
           <label>Test Active Callsign
-            <input id="aerodataboxTestFlight" type="text" placeholder="Example: UAL1234">
+            <input id="airlabsTestFlight" type="text" placeholder="Example: UAL1234">
           </label>
-          <button id="testAerodataboxKey" type="button">Test Route Lookup</button>
+          <button id="testAirlabsKey" type="button">Test Route Lookup</button>
         </div>
-        <div id="aerodataboxMessage" class="message">AeroDataBox configuration status loading…</div>
+        <div id="airlabsMessage" class="message">AirLabs configuration status loading…</div>
       </div>
       <button id="pickLocationOnMap" type="button">Pick Location on Map</button>
       <button id="cancelLocationPick" class="stop" type="button" disabled>Cancel Map Pick</button><div id="locationMessage" class="message warning">Loading receiver location…</div>
@@ -327,7 +327,7 @@ body { padding: 0; }
           <dt>Altitude</dt><dd id="detailAltitude">—</dd>
           <dt>Speed / Track</dt><dd id="detailMovement">—</dd>
         </dl>
-        <div class="detail-source">Aircraft/photo enrichment: ADSBDB public lookup service. Route enrichment: AeroDataBox when configured. Position data: local readsb receiver.</div>
+        <div class="detail-source">Aircraft/photo enrichment: ADSBDB. Route enrichment: AirLabs when configured. Position data: local readsb receiver.</div>
       </div>
       <div>
         <div id="aircraftPhotoFrame" class="aircraft-photo-frame">
@@ -1038,60 +1038,28 @@ async function fetchAircraftEnrichment(identifier, callsign = '') {
   const result = await response.json();
   return result.response && typeof result.response === 'object' ? result.response : null;
 }
-function routeAirportLabel(iata, icao) {
-  if (iata && icao) return `${iata} (${icao})`;
-  return iata || icao || 'Unavailable';
-}
-async function applyAirLabsRouteLookup(flight, rawHex) {
-  const callsign = String(flight || '').trim().toUpperCase();
-  if (!callsign) {
-    detailValue('detailRouteSource', 'No flight callsign broadcast');
-    return;
-  }
-  try {
-    const route = await jsonRequest(
-      `/api/aircraft/route?flight=${encodeURIComponent(callsign)}&hex=${encodeURIComponent(rawHex || '')}`
-    );
-    if (!route.configured) {
-      detailValue('detailRouteSource', 'AirLabs not configured');
-      return;
-    }
-    if (!route.matched) {
-      detailValue('detailRouteSource', 'AirLabs — no route match');
-      return;
-    }
-    detailValue('detailOrigin', routeAirportLabel(route.departure_iata, route.departure_icao));
-    detailValue('detailDestination', routeAirportLabel(route.arrival_iata, route.arrival_icao));
-    detailValue('detailRouteSource', 'AirLabs live flight lookup');
-    if (route.flight_iata) {
-      detailValue('detailFlight', `${callsign} / ${route.flight_iata}`);
-    }
-  } catch (error) {
-    detailValue('detailRouteSource', `AirLabs unavailable: ${error.message}`);
-  }
-}
-
-async function applyAerodataboxRouteLookup(flight, rawHex) {
+async function applyAirlabsRouteToDetails(flight) {
   const callsign = String(flight || '').trim().toUpperCase();
   if (!callsign) {
     detailValue('detailRouteSource', 'No callsign broadcast');
     return;
   }
   try {
-    const result = await requestAerodataboxRoute(callsign, rawHex);
+    const result = await requestAirlabsDiagnosticRoute(callsign);
     if (!result.configured) {
-      detailValue('detailRouteSource', 'AeroDataBox not configured');
+      detailValue('detailRouteSource', 'AirLabs not configured');
       return;
     }
     if (!result.matched) {
-      detailValue('detailRouteSource', 'AeroDataBox — no route match');
+      detailValue('detailRouteSource', 'AirLabs — no route match');
       return;
     }
-    detailValue('detailOrigin', formatAeroRouteAirport(result.departure));
-    detailValue('detailDestination', formatAeroRouteAirport(result.arrival));
-    detailValue('detailRouteSource', 'AeroDataBox via RapidAPI');
+    detailValue('detailOrigin', formatAirlabsAirport(result.departure_iata, result.departure_icao));
+    detailValue('detailDestination', formatAirlabsAirport(result.arrival_iata, result.arrival_icao));
+    detailValue('detailRouteSource', 'AirLabs Flight Information API');
+    if (result.flight_iata) detailValue('detailFlight', `${callsign} / ${result.flight_iata}`);
   } catch (error) {
-    detailValue('detailRouteSource', `AeroDataBox unavailable: ${error.message}`);
+    detailValue('detailRouteSource', `AirLabs unavailable: ${error.message}`);
   }
 }
 
@@ -1105,7 +1073,6 @@ async function showAircraftDetails(aircraft) {
   el('aircraftDetailOverlay').classList.add('open');
   detailValue('detailFlight', flight || 'Not broadcast');
   detailValue('detailHex', rawHex || 'Not broadcast');
-  detailValue('detailRouteSource', 'Checking AeroDataBox…');
   detailValue('detailRouteSource', 'Checking AirLabs…');
   detailValue('detailRegistration', broadcastTail || 'Loading…');
   detailValue('detailManufacturer', 'Loading…');
@@ -1190,8 +1157,7 @@ async function showAircraftDetails(aircraft) {
     setAircraftPhotoCandidates([], 'Photograph lookup unavailable.');
     setMessage('aircraftDetailStatus', `Public detail lookup unavailable: ${error.message}`, 'error');
   }
-  await applyAirLabsRouteLookup(flight, rawHex);
-  await applyAerodataboxRouteLookup(flight, rawHex);
+  await applyAirlabsRouteToDetails(flight);
 }
 
 async function updateAircraft() {
@@ -1225,86 +1191,80 @@ async function updateAircraft() {
   }
 }
 
-async function loadAerodataboxSettings() {
+async function loadAirlabsSettings() {
   try {
-    const status = await jsonRequest('/api/settings/aerodatabox');
-    el('aerodataboxApiKey').value = '';
+    const status = await jsonRequest('/api/diagnostics/airlabs/status');
+    el('airlabsApiKey').value = '';
     setMessage(
-      'aerodataboxMessage',
+      'airlabsMessage',
       status.configured
-        ? `AeroDataBox route lookup configured (${status.key_hint}).`
-        : 'AeroDataBox is not configured. Create a RapidAPI key, then save it here.',
+        ? `AirLabs route lookup configured (${status.key_hint}).`
+        : 'AirLabs is not configured. Paste an API key and save it here.',
       status.configured ? 'good' : 'warning'
     );
   } catch (error) {
-    setMessage('aerodataboxMessage', `Unable to load AeroDataBox settings: ${error.message}`, 'error');
+    setMessage('airlabsMessage', `Unable to load AirLabs status: ${error.message}`, 'error');
   }
 }
-async function saveAerodataboxKey() {
-  const apiKey = el('aerodataboxApiKey').value.trim();
+async function saveAirlabsKey() {
+  const apiKey = el('airlabsApiKey').value.trim();
   if (!apiKey) {
-    setMessage('aerodataboxMessage', 'Paste the RapidAPI key before saving.', 'warning');
+    setMessage('airlabsMessage', 'Paste the AirLabs API key before saving.', 'warning');
     return;
   }
   try {
-    const result = await jsonRequest('/api/settings/aerodatabox', {
+    const result = await jsonRequest('/api/diagnostics/airlabs/settings', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({api_key: apiKey})
     });
-    el('aerodataboxApiKey').value = '';
-    setMessage('aerodataboxMessage', `AeroDataBox API key saved on the Pi (${result.key_hint}).`, 'good');
+    if (!result.configured) throw new Error('Pi could not read back the saved AirLabs key.');
+    el('airlabsApiKey').value = '';
+    setMessage('airlabsMessage', `AirLabs key saved on the Pi (${result.key_hint}).`, 'good');
   } catch (error) {
-    setMessage('aerodataboxMessage', `AeroDataBox key save failed: ${error.message}`, 'error');
+    setMessage('airlabsMessage', `AirLabs key save failed: ${error.message}`, 'error');
   }
 }
-async function clearAerodataboxKey() {
+async function clearAirlabsKey() {
   try {
-    await jsonRequest('/api/settings/aerodatabox', {
+    await jsonRequest('/api/diagnostics/airlabs/settings', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({clear: true})
     });
-    el('aerodataboxApiKey').value = '';
-    setMessage('aerodataboxMessage', 'AeroDataBox API key removed from the Pi.', 'good');
+    el('airlabsApiKey').value = '';
+    setMessage('airlabsMessage', 'AirLabs key removed from the Pi.', 'good');
   } catch (error) {
-    setMessage('aerodataboxMessage', `AeroDataBox key clear failed: ${error.message}`, 'error');
+    setMessage('airlabsMessage', `AirLabs key clear failed: ${error.message}`, 'error');
   }
 }
-function formatAeroRouteAirport(airport) {
-  if (!airport) return 'Unavailable';
-  const code = airport.iata || airport.icao || '';
-  const secondCode = airport.iata && airport.icao ? ` (${airport.icao})` : '';
-  const name = airport.name ? ` — ${airport.name}` : '';
-  return `${code}${secondCode}${name}` || 'Unavailable';
+function formatAirlabsAirport(iata, icao) {
+  if (iata && icao) return `${iata} (${icao})`;
+  return iata || icao || 'Unavailable';
 }
-async function requestAerodataboxRoute(flight, rawHex) {
-  return await jsonRequest(
-    `/api/aircraft/route?flight=${encodeURIComponent(flight || '')}&hex=${encodeURIComponent(rawHex || '')}`
-  );
+async function requestAirlabsDiagnosticRoute(flight) {
+  return await jsonRequest(`/api/diagnostics/airlabs/route?flight=${encodeURIComponent(flight || '')}`);
 }
-async function testAerodataboxKey() {
-  const flight = el('aerodataboxTestFlight').value.trim().toUpperCase();
+async function testAirlabsKey() {
+  const flight = el('airlabsTestFlight').value.trim().toUpperCase();
   if (!flight) {
-    setMessage('aerodataboxMessage', 'Enter a currently active commercial callsign such as UAL1234.', 'warning');
+    setMessage('airlabsMessage', 'Enter an active airline callsign such as UAL1234.', 'warning');
     return;
   }
   try {
-    setMessage('aerodataboxMessage', `Testing AeroDataBox route lookup for ${flight}…`, 'warning');
-    const result = await requestAerodataboxRoute(flight, '');
-    if (!result.configured) {
-      setMessage('aerodataboxMessage', 'Save an AeroDataBox API key before testing.', 'warning');
-    } else if (result.matched) {
+    setMessage('airlabsMessage', `Testing AirLabs route lookup for ${flight}…`, 'warning');
+    const result = await requestAirlabsDiagnosticRoute(flight);
+    if (result.matched) {
       setMessage(
-        'aerodataboxMessage',
-        `${flight}: ${formatAeroRouteAirport(result.departure)} → ${formatAeroRouteAirport(result.arrival)}.`,
+        'airlabsMessage',
+        `${flight}: ${formatAirlabsAirport(result.departure_iata, result.departure_icao)} → ${formatAirlabsAirport(result.arrival_iata, result.arrival_icao)}.`,
         'good'
       );
     } else {
-      setMessage('aerodataboxMessage', result.message || `No route matched ${flight}.`, 'warning');
+      setMessage('airlabsMessage', result.message || `No AirLabs route matched ${flight}.`, 'warning');
     }
   } catch (error) {
-    setMessage('aerodataboxMessage', `Route lookup test failed: ${error.message}`, 'error');
+    setMessage('airlabsMessage', `Route lookup test failed: ${error.message}`, 'error');
   }
 }
 
@@ -1909,9 +1869,9 @@ function bindControls() {
   el('capture10').addEventListener('click', captureNoaa);
   el('autoNoaa').addEventListener('click', autoNoaa);
   el('saveLocation').addEventListener('click', saveLocation);
-  el('saveAerodataboxKey').addEventListener('click', saveAerodataboxKey);
-  el('clearAerodataboxKey').addEventListener('click', clearAerodataboxKey);
-  el('testAerodataboxKey').addEventListener('click', testAerodataboxKey);
+  el('saveAirlabsKey').addEventListener('click', saveAirlabsKey);
+  el('clearAirlabsKey').addEventListener('click', clearAirlabsKey);
+  el('testAirlabsKey').addEventListener('click', testAirlabsKey);
   el('rescanNoaaChannel').addEventListener('click', rescanSavedNoaaChannel);
   el('loadAirbandChannels').addEventListener('click', loadAirbandChannels);
   el('activityScanStart').addEventListener('click', startExperimentalScan);
@@ -1953,7 +1913,7 @@ document.addEventListener('DOMContentLoaded', () => {
   el('trailRetention').value = String(aircraftTrailRetentionMinutes);
   renderStoredTrails();
   bindControls();
-  loadAerodataboxSettings();
+  loadAirlabsSettings();
   loadPiTrailHistory();
   updateStatus();
   updateAircraft();
