@@ -10,6 +10,9 @@ import struct
 import subprocess
 import threading
 import time
+import urllib.request
+import urllib.parse
+import urllib.error
 import wave
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +26,7 @@ WEB_ROOT = ROOT / "web"
 OUTPUT_DIR = ROOT / "test_output"
 SETTINGS_DIR = ROOT / "settings"
 RECEIVER_LOCATION_PATH = SETTINGS_DIR / "receiver_location.json"
+AIRLABS_DIAGNOSTIC_SETTINGS_PATH = SETTINGS_DIR / "airlabs_api.json"
 NOAA_SELECTION_PATH = SETTINGS_DIR / "selected_noaa_channel.json"
 TRAIL_HISTORY_PATH = SETTINGS_DIR / "aircraft_trails_history.json"
 TRAIL_CONTROL_PATH = SETTINGS_DIR / "aircraft_trails_control.json"
@@ -205,6 +209,112 @@ def clear_saved_noaa_selection() -> None:
         NOAA_SELECTION_PATH.unlink()
     except FileNotFoundError:
         pass
+
+
+def read_airlabs_diagnostic_key() -> str:
+    settings = read_json(AIRLABS_DIAGNOSTIC_SETTINGS_PATH)
+    if not isinstance(settings, dict):
+        return ""
+    return str(settings.get("api_key", "")).strip()
+
+
+def airlabs_diagnostic_status() -> dict:
+    key = read_airlabs_diagnostic_key()
+    return {
+        "provider": "AirLabs",
+        "diagnostic_only": True,
+        "configured": bool(key),
+        "key_hint": ("Ending in " + key[-4:]) if key else None,
+        "settings_file": AIRLABS_DIAGNOSTIC_SETTINGS_PATH.name,
+    }
+
+
+def clean_airlabs_callsign(value: str) -> str:
+    return "".join(character for character in str(value or "").upper().strip() if character.isalnum())
+
+
+def test_airlabs_route_diagnostic(flight: str) -> dict:
+    status = airlabs_diagnostic_status()
+    key = read_airlabs_diagnostic_key()
+    base = {
+        "provider": "AirLabs",
+        "diagnostic_only": True,
+        "configured": status["configured"],
+        "key_hint": status["key_hint"],
+    }
+    if not key:
+        return {
+            **base,
+            "matched": False,
+            "message": "No readable AirLabs key was found in settings/airlabs_api.json.",
+        }
+
+    callsign = clean_airlabs_callsign(flight)
+    if not callsign:
+        return {
+            **base,
+            "matched": False,
+            "message": "Provide a commercial flight ICAO callsign, for example UAL1234.",
+        }
+
+    query = urllib.parse.urlencode({"flight_icao": callsign, "api_key": key})
+    request_url = "https://airlabs.co/api/v9/flight?" + query
+    request = urllib.request.Request(
+        request_url,
+        headers={"Accept": "application/json", "User-Agent": "RTL-Pi-ADS-B-Tracker/diagnostic"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:240]
+        return {
+            **base,
+            "matched": False,
+            "message": f"AirLabs HTTP {exc.code}: {body}",
+        }
+    except Exception as exc:
+        return {
+            **base,
+            "matched": False,
+            "message": f"AirLabs request failed: {exc}",
+        }
+
+    if isinstance(payload, dict) and payload.get("error"):
+        error = payload["error"]
+        message = error.get("message") if isinstance(error, dict) else str(error)
+        return {
+            **base,
+            "matched": False,
+            "message": f"AirLabs error: {message}",
+        }
+
+    record = payload.get("response") if isinstance(payload, dict) and isinstance(payload.get("response"), dict) else payload
+    if not isinstance(record, dict):
+        return {
+            **base,
+            "matched": False,
+            "message": f"No route record returned for {callsign}.",
+        }
+
+    fields = {
+        "flight_icao": record.get("flight_icao") or callsign,
+        "flight_iata": record.get("flight_iata"),
+        "departure_iata": record.get("dep_iata"),
+        "departure_icao": record.get("dep_icao"),
+        "arrival_iata": record.get("arr_iata"),
+        "arrival_icao": record.get("arr_icao"),
+        "registration": record.get("reg_number"),
+        "aircraft_icao": record.get("aircraft_icao"),
+        "status": record.get("status"),
+    }
+    matched = any(fields[name] for name in ("departure_iata", "departure_icao", "arrival_iata", "arrival_icao"))
+    return {
+        **base,
+        "matched": matched,
+        **fields,
+        "message": "Route fields returned." if matched else f"AirLabs returned no origin/destination for {callsign}.",
+    }
 
 
 def first_present(record: dict, names: tuple[str, ...]) -> object | None:
@@ -1319,6 +1429,16 @@ class Handler(BaseHTTPRequestHandler):
                     "trails": {},
                 }
             self.send_json(history)
+            return
+
+        if request.path == "/api/diagnostics/airlabs/status":
+            self.send_json(airlabs_diagnostic_status())
+            return
+
+        if request.path == "/api/diagnostics/airlabs/route":
+            parameters = parse_qs(request.query)
+            flight = parameters.get("flight", [""])[0]
+            self.send_json(test_airlabs_route_diagnostic(flight))
             return
 
         if request.path == "/api/status":
