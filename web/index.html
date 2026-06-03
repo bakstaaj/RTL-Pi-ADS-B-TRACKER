@@ -289,10 +289,11 @@ body { padding: 0; }
           <dt>Operator</dt><dd id="detailOperator">—</dd>
           <dt>From</dt><dd id="detailOrigin">—</dd>
           <dt>To</dt><dd id="detailDestination">—</dd>
+          <dt>Route Source</dt><dd id="detailRouteSource">—</dd>
           <dt>Altitude</dt><dd id="detailAltitude">—</dd>
           <dt>Speed / Track</dt><dd id="detailMovement">—</dd>
         </dl>
-        <div class="detail-source">Aircraft, route and available photograph enrichment: ADSBDB public lookup service. Position data: local readsb receiver.</div>
+        <div class="detail-source">Aircraft/photo enrichment: ADSBDB public lookup service. Route enrichment: AirLabs when configured. Position data: local readsb receiver.</div>
       </div>
       <div>
         <div id="aircraftPhotoFrame" class="aircraft-photo-frame">
@@ -1003,6 +1004,39 @@ async function fetchAircraftEnrichment(identifier, callsign = '') {
   const result = await response.json();
   return result.response && typeof result.response === 'object' ? result.response : null;
 }
+function routeAirportLabel(iata, icao) {
+  if (iata && icao) return `${iata} (${icao})`;
+  return iata || icao || 'Unavailable';
+}
+async function applyAirLabsRouteLookup(flight, rawHex) {
+  const callsign = String(flight || '').trim().toUpperCase();
+  if (!callsign) {
+    detailValue('detailRouteSource', 'No flight callsign broadcast');
+    return;
+  }
+  try {
+    const route = await jsonRequest(
+      `/api/aircraft/route?flight=${encodeURIComponent(callsign)}&hex=${encodeURIComponent(rawHex || '')}`
+    );
+    if (!route.configured) {
+      detailValue('detailRouteSource', 'AirLabs not configured');
+      return;
+    }
+    if (!route.matched) {
+      detailValue('detailRouteSource', 'AirLabs — no route match');
+      return;
+    }
+    detailValue('detailOrigin', routeAirportLabel(route.departure_iata, route.departure_icao));
+    detailValue('detailDestination', routeAirportLabel(route.arrival_iata, route.arrival_icao));
+    detailValue('detailRouteSource', 'AirLabs live flight lookup');
+    if (route.flight_iata) {
+      detailValue('detailFlight', `${callsign} / ${route.flight_iata}`);
+    }
+  } catch (error) {
+    detailValue('detailRouteSource', `AirLabs unavailable: ${error.message}`);
+  }
+}
+
 async function showAircraftDetails(aircraft) {
   const flight = aircraft.flight ? String(aircraft.flight).trim().toUpperCase() : '';
   const rawHex = String(aircraft.hex || '').replace(/^~/, '').toUpperCase();
@@ -1013,6 +1047,7 @@ async function showAircraftDetails(aircraft) {
   el('aircraftDetailOverlay').classList.add('open');
   detailValue('detailFlight', flight || 'Not broadcast');
   detailValue('detailHex', rawHex || 'Not broadcast');
+  detailValue('detailRouteSource', 'Checking AirLabs…');
   detailValue('detailRegistration', broadcastTail || 'Loading…');
   detailValue('detailManufacturer', 'Loading…');
   detailValue('detailModel', 'Loading…');
@@ -1096,6 +1131,7 @@ async function showAircraftDetails(aircraft) {
     setAircraftPhotoCandidates([], 'Photograph lookup unavailable.');
     setMessage('aircraftDetailStatus', `Public detail lookup unavailable: ${error.message}`, 'error');
   }
+  await applyAirLabsRouteLookup(flight, rawHex);
 }
 
 async function updateAircraft() {
