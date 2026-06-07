@@ -2919,5 +2919,362 @@ def build_status() -> dict:
 
 # /AIRBAND_FAST_SPECTRUM_SKIP_LOCKOUT_PATCH_V1
 
+
+# AIRLABS_BACKEND_ROUTE_LOOKUP_PATCH_V2
+# AirLabs route lookup + local key/cache storage.
+import hashlib
+import urllib.parse
+import urllib.request
+
+
+AIRLABS_CACHE_TTL_SECONDS = int(os.environ.get("RTL_PI_AIRLABS_CACHE_TTL_SECONDS", "7200"))
+
+
+def _airlabs_write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _airlabs_read_json(path: Path) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _airlabs_safe_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _airlabs_settings_dir() -> Path:
+    candidates = [
+        globals().get("SETTINGS_DIR"),
+        globals().get("RUNTIME_SETTINGS_DIR"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, Path):
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+
+    deploy_dir = globals().get("DEPLOY_DIR")
+    if isinstance(deploy_dir, Path):
+        settings_dir = deploy_dir / "settings"
+    else:
+        settings_dir = Path("runtime/settings")
+
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    return settings_dir
+
+
+AIRLABS_API_PATH = _airlabs_settings_dir() / "airlabs_api.json"
+AIRLABS_CACHE_PATH = _airlabs_settings_dir() / "airlabs_route_cache.json"
+
+
+def _airlabs_now() -> int:
+    return int(time.time())
+
+
+def _airlabs_normalize_flight(value: object) -> str:
+    flight = str(value or "").strip().upper()
+    flight = "".join(ch for ch in flight if ch.isalnum())
+    return flight
+
+
+def _airlabs_mask_key(api_key: str) -> str | None:
+    if not api_key:
+        return None
+    if len(api_key) <= 8:
+        return "*" * len(api_key)
+    return f"{api_key[:4]}…{api_key[-4:]}"
+
+
+def _airlabs_key_fingerprint(api_key: str) -> str | None:
+    if not api_key:
+        return None
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+
+
+def _airlabs_read_api_config() -> dict:
+    data = _airlabs_read_json(AIRLABS_API_PATH)
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _airlabs_write_api_config(api_key: str) -> dict:
+    config = {
+        "api_key": api_key,
+        "updated_utc": _airlabs_now(),
+    }
+    _airlabs_write_json(AIRLABS_API_PATH, config)
+    try:
+        os.chmod(AIRLABS_API_PATH, 0o600)
+    except OSError:
+        pass
+    return config
+
+
+def _airlabs_clear_api_config() -> None:
+    _airlabs_safe_unlink(AIRLABS_API_PATH)
+
+
+def _airlabs_get_api_key() -> str:
+    config = _airlabs_read_api_config()
+    return str(config.get("api_key") or "").strip()
+
+
+def _airlabs_read_cache() -> dict:
+    data = _airlabs_read_json(AIRLABS_CACHE_PATH)
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _airlabs_write_cache(cache: dict) -> None:
+    _airlabs_write_json(AIRLABS_CACHE_PATH, cache)
+
+
+def _airlabs_public_status() -> dict:
+    config = _airlabs_read_api_config()
+    api_key = str(config.get("api_key") or "").strip()
+    cache = _airlabs_read_cache()
+
+    return {
+        "enabled": bool(api_key),
+        "configured": bool(api_key),
+        "masked_key": _airlabs_mask_key(api_key),
+        "key_fingerprint": _airlabs_key_fingerprint(api_key),
+        "updated_utc": config.get("updated_utc"),
+        "cache_count": len(cache),
+        "cache_ttl_seconds": AIRLABS_CACHE_TTL_SECONDS,
+        "settings_path": str(AIRLABS_API_PATH),
+        "cache_path": str(AIRLABS_CACHE_PATH),
+    }
+
+
+def _airlabs_cache_get(flight_icao: str) -> dict | None:
+    cache = _airlabs_read_cache()
+    entry = cache.get(flight_icao)
+    if not isinstance(entry, dict):
+        return None
+
+    cached_utc = int(entry.get("cached_utc") or 0)
+    if cached_utc <= 0 or _airlabs_now() - cached_utc > AIRLABS_CACHE_TTL_SECONDS:
+        cache.pop(flight_icao, None)
+        _airlabs_write_cache(cache)
+        return None
+
+    result = dict(entry.get("result") or {})
+    if result:
+        result["cached"] = True
+        result["cached_utc"] = cached_utc
+        return result
+    return None
+
+
+def _airlabs_cache_put(flight_icao: str, result: dict) -> None:
+    cache = _airlabs_read_cache()
+    cache[flight_icao] = {
+        "cached_utc": _airlabs_now(),
+        "result": result,
+    }
+    _airlabs_write_cache(cache)
+
+
+def _airlabs_clear_cache() -> int:
+    cache = _airlabs_read_cache()
+    count = len(cache)
+    _airlabs_safe_unlink(AIRLABS_CACHE_PATH)
+    return count
+
+
+def _airlabs_extract_route(record: dict) -> dict:
+    dep_iata = record.get("dep_iata") or record.get("departure_iata")
+    dep_icao = record.get("dep_icao") or record.get("departure_icao")
+    arr_iata = record.get("arr_iata") or record.get("arrival_iata")
+    arr_icao = record.get("arr_icao") or record.get("arrival_icao")
+
+    result = {
+        "found": bool(dep_iata or dep_icao or arr_iata or arr_icao),
+        "from": dep_iata or dep_icao,
+        "to": arr_iata or arr_icao,
+        "dep_iata": dep_iata,
+        "dep_icao": dep_icao,
+        "dep_name": record.get("dep_name") or record.get("departure_name"),
+        "arr_iata": arr_iata,
+        "arr_icao": arr_icao,
+        "arr_name": record.get("arr_name") or record.get("arrival_name"),
+        "airline_iata": record.get("airline_iata"),
+        "airline_icao": record.get("airline_icao"),
+        "flight_iata": record.get("flight_iata"),
+        "flight_icao": record.get("flight_icao"),
+        "source": "airlabs",
+        "cached": False,
+        "looked_up_utc": _airlabs_now(),
+        "raw": record,
+    }
+    return result
+
+
+def _airlabs_lookup_route_live(flight_icao: str, api_key: str) -> dict:
+    params = urllib.parse.urlencode({
+        "flight_icao": flight_icao,
+        "api_key": api_key,
+    })
+
+    endpoint = os.environ.get("RTL_PI_AIRLABS_FLIGHTS_ENDPOINT", "https://airlabs.co/api/v9/flights")
+    url = f"{endpoint}?{params}"
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "RTL-Pi-ADS-B-Tracker/airlabs-route-lookup",
+            "Accept": "application/json",
+        },
+    )
+
+    with urllib.request.urlopen(request, timeout=8) as response:
+        raw_body = response.read().decode("utf-8", errors="replace")
+
+    payload = json.loads(raw_body)
+    response_data = payload.get("response")
+
+    if isinstance(response_data, list):
+        if not response_data:
+            return {
+                "found": False,
+                "flight_icao": flight_icao,
+                "source": "airlabs",
+                "cached": False,
+                "looked_up_utc": _airlabs_now(),
+                "message": "AirLabs returned no matching flights.",
+            }
+        record = response_data[0]
+    elif isinstance(response_data, dict):
+        record = response_data
+    else:
+        return {
+            "found": False,
+            "flight_icao": flight_icao,
+            "source": "airlabs",
+            "cached": False,
+            "looked_up_utc": _airlabs_now(),
+            "message": "AirLabs response did not include route data.",
+            "raw": payload,
+        }
+
+    result = _airlabs_extract_route(record)
+    result["flight_icao_requested"] = flight_icao
+    return result
+
+
+def _airlabs_route_payload(query: str) -> tuple[dict, HTTPStatus]:
+    parameters = urllib.parse.parse_qs(query, keep_blank_values=True)
+    flight_icao = _airlabs_normalize_flight(
+        (parameters.get("flight_icao") or parameters.get("callsign") or parameters.get("flight") or [""])[0]
+    )
+
+    if not flight_icao:
+        return {"error": "Missing flight_icao/callsign parameter."}, HTTPStatus.BAD_REQUEST
+
+    cached = _airlabs_cache_get(flight_icao)
+    if cached is not None:
+        return {"flight_icao": flight_icao, "route": cached, "cached": True}, HTTPStatus.OK
+
+    api_key = _airlabs_get_api_key()
+    if not api_key:
+        return {
+            "error": "AirLabs API key is not configured.",
+            "flight_icao": flight_icao,
+            "status": _airlabs_public_status(),
+        }, HTTPStatus.CONFLICT
+
+    try:
+        route = _airlabs_lookup_route_live(flight_icao, api_key)
+    except Exception as exc:
+        return {
+            "error": f"AirLabs route lookup failed: {exc}",
+            "flight_icao": flight_icao,
+        }, HTTPStatus.BAD_GATEWAY
+
+    if route.get("found"):
+        _airlabs_cache_put(flight_icao, route)
+
+    return {
+        "flight_icao": flight_icao,
+        "route": route,
+        "cached": False,
+    }, HTTPStatus.OK
+
+
+_original_airlabs_do_get = Handler.do_GET
+
+
+def _airlabs_do_get(self) -> None:
+    request = urlparse(self.path)
+
+    if request.path == "/api/diagnostics/airlabs/status":
+        self.send_json(_airlabs_public_status())
+        return
+
+    if request.path == "/api/diagnostics/airlabs/route":
+        payload, status = _airlabs_route_payload(request.query)
+        self.send_json(payload, status)
+        return
+
+    return _original_airlabs_do_get(self)
+
+
+Handler.do_GET = _airlabs_do_get
+
+
+_original_airlabs_do_post = Handler.do_POST
+
+
+def _airlabs_do_post(self) -> None:
+    request = urlparse(self.path)
+
+    if request.path == "/api/diagnostics/airlabs/settings":
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length).decode("utf-8", errors="replace") if length else "{}"
+
+        try:
+            payload = json.loads(body or "{}")
+        except json.JSONDecodeError:
+            self.send_json({"error": "Invalid JSON body."}, HTTPStatus.BAD_REQUEST)
+            return
+
+        action = str(payload.get("action") or "save").strip().lower()
+        if action in {"clear", "delete", "remove"}:
+            _airlabs_clear_api_config()
+            self.send_json({"saved": False, "cleared": True, "status": _airlabs_public_status()})
+            return
+
+        api_key = str(payload.get("api_key") or "").strip()
+        if not api_key:
+            self.send_json({"error": "Missing api_key."}, HTTPStatus.BAD_REQUEST)
+            return
+
+        _airlabs_write_api_config(api_key)
+        self.send_json({"saved": True, "status": _airlabs_public_status()})
+        return
+
+    if request.path == "/api/diagnostics/airlabs/cache/clear":
+        cleared = _airlabs_clear_cache()
+        self.send_json({"cleared": cleared, "status": _airlabs_public_status()})
+        return
+
+    return _original_airlabs_do_post(self)
+
+
+Handler.do_POST = _airlabs_do_post
+
+# /AIRLABS_BACKEND_ROUTE_LOOKUP_PATCH_V2
+
 if __name__ == "__main__":
     main()
