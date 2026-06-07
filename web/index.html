@@ -2460,6 +2460,32 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  function enforceLiveOnlyAirbandControls(status) {
+    // AIRBAND_CONTROLS_LIVE_ONLY_ENFORCE_PATCH_V1
+    // Skip, Block, and Squelch +/- apply to the currently open live latch only.
+    // Keep them disabled when stopped, idle, or spectrum-searching.
+    const liveLatchActive = !!(status && status.airband_live_audio_running);
+    const current = status ? (status.airband_locked_channel || status.airband_current_channel) : null;
+
+    const skipButton = byId(`${PATCH_ID}-skip`);
+    const blockButton = byId(`${PATCH_ID}-block`);
+    const squelchDownButton = byId(`${PATCH_ID}-sqdown`);
+    const squelchUpButton = byId(`${PATCH_ID}-squp`);
+
+    if (skipButton) {
+      skipButton.disabled = !liveLatchActive;
+    }
+    if (blockButton) {
+      blockButton.disabled = !liveLatchActive || !current;
+    }
+    if (squelchDownButton) {
+      squelchDownButton.disabled = !liveLatchActive;
+    }
+    if (squelchUpButton) {
+      squelchUpButton.disabled = !liveLatchActive;
+    }
+  }
+
   function updateStatusUi(status) {
     lastStatus = status;
 
@@ -2524,6 +2550,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (status.airband_live_audio_running && audioEnabled && !audioLoopRunning) {
       startAudioLoop();
     }
+
+    enforceLiveOnlyAirbandControls(status);
   }
 
   async function refreshStatus() {
@@ -2708,6 +2736,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     insertPanels();
     wireControls();
+    enforceLiveOnlyAirbandControls({ airband_live_audio_running: false });
     refreshStatus();
 
     if (pollTimer) {
