@@ -1693,5 +1693,1231 @@ def main() -> None:
         stop_child_on_shutdown()
         server.server_close()
 
+
+# --- Airband normal scanner patch v1 ---
+# This block is intentionally self-contained. It wraps the existing v3.0.0
+# activity-scan implementation to behave like a normal scanner: search, lock,
+# stream live browser audio, skip, block, and resume after squelch silence.
+
+AIRBAND_SETTINGS_PATH = SETTINGS_DIR / "airband_scanner_settings.json"
+AIRBAND_BLOCKED_PATH = SETTINGS_DIR / "airband_blocked_frequencies.json"
+AIRBAND_LIVE_WAV_PATH = OUTPUT_DIR / "airband_live_source.wav"
+AIRBAND_LIVE_LOG_PATH = OUTPUT_DIR / "airband_live_receiver.log"
+
+airband_skip_event = threading.Event()
+airband_live_process: subprocess.Popen[str] | None = None
+airband_live_log_handle = None
+
+runtime_state.setdefault("airband_locked_channel", None)
+runtime_state.setdefault("airband_live_audio_running", False)
+runtime_state.setdefault("airband_live_available_samples", 0)
+runtime_state.setdefault("airband_silence_remaining", None)
+runtime_state.setdefault("airband_lock_reason", None)
+runtime_state.setdefault("airband_scanner_message", "Airband scanner idle.")
+
+DEFAULT_AIRBAND_SCANNER_SETTINGS = {
+    "snr_threshold_db": AIRBAND_ACTIVITY_THRESHOLD_SNR_DB,
+    "squelch_dbfs": -38.0,
+    "rf_gain_db": float(RF_GAIN_DB),
+    "sample_ms": 250,
+    "silence_resume_seconds": 7.0,
+}
+
+
+def _airband_clamp_float(value: object, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(parsed, minimum), maximum)
+
+
+def _airband_clamp_int(value: object, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(parsed, minimum), maximum)
+
+
+def read_airband_scanner_settings() -> dict:
+    saved = read_json(AIRBAND_SETTINGS_PATH)
+    if not isinstance(saved, dict):
+        saved = {}
+    defaults = DEFAULT_AIRBAND_SCANNER_SETTINGS
+    return {
+        "snr_threshold_db": _airband_clamp_float(saved.get("snr_threshold_db"), float(defaults["snr_threshold_db"]), -30.0, 60.0),
+        "squelch_dbfs": _airband_clamp_float(saved.get("squelch_dbfs"), float(defaults["squelch_dbfs"]), -90.0, -5.0),
+        "rf_gain_db": _airband_clamp_float(saved.get("rf_gain_db"), float(defaults["rf_gain_db"]), 0.0, 49.6),
+        "sample_ms": _airband_clamp_int(saved.get("sample_ms"), int(defaults["sample_ms"]), 100, 2000),
+        "silence_resume_seconds": _airband_clamp_float(saved.get("silence_resume_seconds"), float(defaults["silence_resume_seconds"]), 1.0, 30.0),
+    }
+
+
+def save_airband_scanner_settings(settings: dict) -> dict:
+    current = read_airband_scanner_settings()
+    current.update({
+        "snr_threshold_db": _airband_clamp_float(settings.get("snr_threshold_db", current["snr_threshold_db"]), current["snr_threshold_db"], -30.0, 60.0),
+        "squelch_dbfs": _airband_clamp_float(settings.get("squelch_dbfs", current["squelch_dbfs"]), current["squelch_dbfs"], -90.0, -5.0),
+        "rf_gain_db": _airband_clamp_float(settings.get("rf_gain_db", current["rf_gain_db"]), current["rf_gain_db"], 0.0, 49.6),
+        "sample_ms": _airband_clamp_int(settings.get("sample_ms", current["sample_ms"]), current["sample_ms"], 100, 2000),
+        "silence_resume_seconds": _airband_clamp_float(settings.get("silence_resume_seconds", current["silence_resume_seconds"]), current["silence_resume_seconds"], 1.0, 30.0),
+        "updated_utc": int(time.time()),
+    })
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    temp = AIRBAND_SETTINGS_PATH.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+    temp.replace(AIRBAND_SETTINGS_PATH)
+    return current
+
+
+def read_airband_blocked_frequencies() -> list[int]:
+    saved = read_json(AIRBAND_BLOCKED_PATH)
+    values = saved.get("blocked_frequencies_hz", []) if isinstance(saved, dict) else []
+    blocked: list[int] = []
+    if isinstance(values, list):
+        for value in values:
+            try:
+                frequency_hz = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 118000000 <= frequency_hz <= 137000000 and frequency_hz not in blocked:
+                blocked.append(frequency_hz)
+    return sorted(blocked)
+
+
+def save_airband_blocked_frequencies(frequencies_hz: list[int]) -> list[int]:
+    clean = sorted({int(value) for value in frequencies_hz if 118000000 <= int(value) <= 137000000})
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    temp = AIRBAND_BLOCKED_PATH.with_suffix(".json.tmp")
+    temp.write_text(json.dumps({"blocked_frequencies_hz": clean, "updated_utc": int(time.time())}, indent=2) + "\n", encoding="utf-8")
+    temp.replace(AIRBAND_BLOCKED_PATH)
+    return clean
+
+
+def airband_live_available_samples() -> int:
+    try:
+        return max(0, (AIRBAND_LIVE_WAV_PATH.stat().st_size - 44) // 2)
+    except FileNotFoundError:
+        return 0
+
+
+def recent_airband_pcm_rms_dbfs(path: Path, seconds: float = 1.0) -> float:
+    try:
+        file_size = path.stat().st_size
+        available_bytes = max(0, file_size - 44)
+        if available_bytes < 2400:
+            return -120.0
+        samples_to_read = max(1200, int(AUDIO_RATE_HZ * seconds))
+        bytes_to_read = min(available_bytes, samples_to_read * 2)
+        with path.open("rb") as audio_file:
+            audio_file.seek(44 + available_bytes - bytes_to_read)
+            pcm_data = audio_file.read(bytes_to_read)
+    except OSError:
+        return -120.0
+
+    count = len(pcm_data) // 2
+    if count <= 0:
+        return -120.0
+    total_square = 0.0
+    for (sample,) in struct.iter_unpack("<h", pcm_data[: count * 2]):
+        normalized = float(sample) / 32768.0
+        total_square += normalized * normalized
+    if total_square <= 0.0:
+        return -120.0
+    return 20.0 * math.log10(math.sqrt(total_square / count))
+
+
+def refresh_airband_live_process_locked() -> bool:
+    global airband_live_process, airband_live_log_handle
+    process = airband_live_process
+    if process is None:
+        runtime_state["airband_live_audio_running"] = False
+        runtime_state["airband_live_available_samples"] = 0
+        return False
+    return_code = process.poll()
+    if return_code is None:
+        runtime_state["airband_live_audio_running"] = True
+        runtime_state["airband_live_available_samples"] = airband_live_available_samples()
+        return True
+    if airband_live_log_handle is not None:
+        airband_live_log_handle.close()
+        airband_live_log_handle = None
+    airband_live_process = None
+    runtime_state["airband_live_audio_running"] = False
+    runtime_state["airband_live_available_samples"] = 0
+    runtime_state["airband_lock_reason"] = f"receiver_exited_{return_code}"
+    return False
+
+
+def stop_airband_live_process_locked() -> None:
+    global airband_live_process, airband_live_log_handle
+    process = airband_live_process
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+    if airband_live_log_handle is not None:
+        airband_live_log_handle.close()
+        airband_live_log_handle = None
+    airband_live_process = None
+    runtime_state["airband_live_audio_running"] = False
+    runtime_state["airband_live_available_samples"] = 0
+
+
+def start_airband_live_process_locked(channel: dict, settings: dict) -> None:
+    global airband_live_process, airband_live_log_handle
+    stop_airband_live_process_locked()
+    safe_unlink(AIRBAND_LIVE_WAV_PATH)
+    safe_unlink(AIRBAND_LIVE_LOG_PATH)
+    command = [
+        str(AIRBAND_BINARY),
+        "--serial", AUDIO_SERIAL,
+        "--freq-hz", str(channel["frequency_hz"]),
+        "--seconds", "3600",
+        "--gain-db", f"{settings['rf_gain_db']:.1f}",
+        "--audio-gain", AIRBAND_AUDIO_OUTPUT_GAIN,
+        "--wav-output", str(AIRBAND_LIVE_WAV_PATH),
+    ]
+    airband_live_log_handle = AIRBAND_LIVE_LOG_PATH.open("w", encoding="utf-8")
+    airband_live_process = subprocess.Popen(command, stdout=airband_live_log_handle, stderr=subprocess.STDOUT, text=True)
+
+
+def monitor_airband_locked_channel(channel: dict, settings: dict) -> str:
+    silence_started: float | None = None
+    reason = "receiver_exited"
+    while not airband_scan_stop_event.is_set():
+        with state_lock:
+            running = refresh_airband_live_process_locked()
+        if not running:
+            break
+        if airband_skip_event.is_set():
+            airband_skip_event.clear()
+            reason = "skipped"
+            break
+
+        available_samples = airband_live_available_samples()
+        recent_rms = recent_airband_pcm_rms_dbfs(AIRBAND_LIVE_WAV_PATH, seconds=1.0)
+        now = time.monotonic()
+        if available_samples < AUDIO_RATE_HZ:
+            remaining = None
+        elif recent_rms >= float(settings["squelch_dbfs"]):
+            silence_started = None
+            remaining = None
+        else:
+            if silence_started is None:
+                silence_started = now
+            remaining = max(0.0, float(settings["silence_resume_seconds"]) - (now - silence_started))
+            if remaining <= 0.0:
+                reason = "silence_timeout"
+                break
+
+        with state_lock:
+            runtime_state["airband_last_measurement_dbfs"] = round(recent_rms, 2)
+            runtime_state["airband_silence_remaining"] = round(remaining, 1) if remaining is not None else None
+            runtime_state["airband_live_available_samples"] = available_samples
+            runtime_state["airband_scanner_message"] = (
+                f"Listening on {channel['frequency_mhz']:.3f} MHz"
+                if remaining is None
+                else f"Silence countdown on {channel['frequency_mhz']:.3f} MHz: {remaining:.1f}s"
+            )
+        time.sleep(0.25)
+
+    with state_lock:
+        stop_airband_live_process_locked()
+        runtime_state["airband_silence_remaining"] = None
+        runtime_state["airband_lock_reason"] = reason
+    return reason
+
+
+def normal_airband_scan_worker(channels: list[dict]) -> None:
+    global airband_scan_thread
+    try:
+        while not airband_scan_stop_event.is_set():
+            settings = read_airband_scanner_settings()
+            blocked = set(read_airband_blocked_frequencies())
+            active_channels = [channel for channel in channels if int(channel["frequency_hz"]) not in blocked]
+
+            with state_lock:
+                runtime_state["airband_scan_cycles"] = int(runtime_state["airband_scan_cycles"]) + 1
+                runtime_state["airband_scan_state"] = "searching"
+                runtime_state["airband_locked_channel"] = None
+                runtime_state["airband_silence_remaining"] = None
+                runtime_state["airband_scanner_message"] = f"Scanning {len(active_channels)} Airband frequencies."
+
+            if not active_channels:
+                with state_lock:
+                    runtime_state["airband_scan_state"] = "blocked_all"
+                    runtime_state["airband_scanner_message"] = "All candidate Airband frequencies are blocked."
+                time.sleep(1.0)
+                continue
+
+            for channel in active_channels:
+                if airband_scan_stop_event.is_set():
+                    break
+                safe_unlink(AIRBAND_SCAN_SAMPLE_PATH)
+                command = [
+                    str(AIRBAND_BINARY),
+                    "--serial", AUDIO_SERIAL,
+                    "--freq-hz", str(channel["frequency_hz"]),
+                    "--duration-ms", str(settings["sample_ms"]),
+                    "--gain-db", f"{settings['rf_gain_db']:.1f}",
+                    "--audio-gain", AIRBAND_AUDIO_OUTPUT_GAIN,
+                    "--wav-output", str(AIRBAND_SCAN_SAMPLE_PATH),
+                ]
+                with state_lock:
+                    runtime_state["airband_current_channel"] = channel
+                    runtime_state["airband_scan_state"] = "searching"
+                    runtime_state["airband_scanner_message"] = f"Scanning {channel['frequency_mhz']:.3f} MHz."
+
+                result = subprocess.run(command, text=True, capture_output=True, timeout=(float(settings["sample_ms"]) / 1000.0) + 20, check=False)
+                if result.returncode != 0:
+                    with state_lock:
+                        runtime_state["airband_scan_error"] = result.stderr.strip() or result.stdout.strip() or "AM scan sample failed."
+                    continue
+
+                rms_dbfs = pcm_wav_rms_dbfs(AIRBAND_SCAN_SAMPLE_PATH)
+                signal_match = re.search(r"RF estimated SNR:\s+(-?[0-9]+(?:\.[0-9]+)?) dB", result.stdout)
+                signal_snr_db = float(signal_match.group(1)) if signal_match else -30.0
+                candidate = {
+                    "channel": channel,
+                    "audio_rms_dbfs": round(rms_dbfs, 2),
+                    "rf_estimated_snr_db": round(signal_snr_db, 2),
+                    "observed_utc": int(time.time()),
+                    "audio_url": "/api/airband/scan/best_audio.wav",
+                }
+
+                with state_lock:
+                    runtime_state["airband_channels_scanned"] = int(runtime_state["airband_channels_scanned"]) + 1
+                    runtime_state["airband_current_channel"] = channel
+                    runtime_state["airband_last_measurement_dbfs"] = round(rms_dbfs, 2)
+                    runtime_state["airband_last_signal_snr_db"] = round(signal_snr_db, 2)
+                    previous_best = runtime_state.get("airband_best_candidate")
+                    if previous_best is None or signal_snr_db > float(previous_best.get("rf_estimated_snr_db", -999.0)):
+                        shutil.copyfile(AIRBAND_SCAN_SAMPLE_PATH, AIRBAND_BEST_WAV_PATH)
+                        runtime_state["airband_best_candidate"] = candidate
+
+                detected = signal_snr_db >= float(settings["snr_threshold_db"]) and rms_dbfs >= float(settings["squelch_dbfs"])
+                if not detected:
+                    continue
+
+                shutil.copyfile(AIRBAND_SCAN_SAMPLE_PATH, AIRBAND_DETECTED_WAV_PATH)
+                detection = {
+                    "channel": channel,
+                    "audio_rms_dbfs": round(rms_dbfs, 2),
+                    "rf_estimated_snr_db": round(signal_snr_db, 2),
+                    "threshold_snr_db": settings["snr_threshold_db"],
+                    "squelch_dbfs": settings["squelch_dbfs"],
+                    "detected_utc": int(time.time()),
+                    "audio_url": "/api/airband/scan/live/audio.wav",
+                }
+                with state_lock:
+                    runtime_state["airband_last_detection"] = detection
+                    runtime_state["airband_locked_channel"] = channel
+                    runtime_state["airband_scan_state"] = "locked"
+                    runtime_state["airband_lock_reason"] = "activity_detected"
+                    runtime_state["airband_scanner_message"] = f"Activity detected; locked on {channel['frequency_mhz']:.3f} MHz."
+                    start_airband_live_process_locked(channel, settings)
+
+                monitor_airband_locked_channel(channel, settings)
+                with state_lock:
+                    if not airband_scan_stop_event.is_set():
+                        runtime_state["airband_scan_state"] = "searching"
+                        runtime_state["airband_locked_channel"] = None
+                        runtime_state["airband_scanner_message"] = "Resuming Airband scan."
+
+    except Exception as exc:
+        with state_lock:
+            runtime_state["airband_scan_error"] = str(exc)
+            runtime_state["airband_scan_state"] = "error"
+            runtime_state["airband_scanner_message"] = f"Airband scanner error: {exc}"
+    finally:
+        with state_lock:
+            stop_airband_live_process_locked()
+            if airband_scan_stop_event.is_set():
+                runtime_state["airband_scan_state"] = "stopped"
+                runtime_state["airband_scanner_message"] = "Airband scanner stopped."
+            elif runtime_state["airband_scan_state"] != "error":
+                runtime_state["airband_scan_state"] = "idle"
+                runtime_state["airband_scanner_message"] = "Airband scanner idle."
+            runtime_state["airband_scan_running"] = False
+            runtime_state["airband_locked_channel"] = None
+            runtime_state["airband_silence_remaining"] = None
+        if receiver_lock.locked():
+            receiver_lock.release()
+        airband_scan_thread = None
+
+
+# Replace the original activity worker. The existing start method will call this
+# name because globals are looked up at call time.
+airband_scan_worker = normal_airband_scan_worker
+
+_original_build_status = build_status
+
+def build_status() -> dict:
+    payload = _original_build_status()
+    with state_lock:
+        airband_live_running = refresh_airband_live_process_locked()
+    payload.update({
+        "airband_live_audio_running": airband_live_running,
+        "airband_live_available_samples": airband_live_available_samples() if airband_live_running else 0,
+        "airband_scanner_settings": read_airband_scanner_settings(),
+        "airband_blocked_frequencies_hz": read_airband_blocked_frequencies(),
+        "airband_locked_channel": runtime_state.get("airband_locked_channel"),
+        "airband_silence_remaining": runtime_state.get("airband_silence_remaining"),
+        "airband_lock_reason": runtime_state.get("airband_lock_reason"),
+        "airband_scanner_message": runtime_state.get("airband_scanner_message"),
+    })
+    if airband_live_running:
+        payload["audio_mode"] = "airband_live"
+    elif runtime_state.get("airband_scan_running"):
+        payload["audio_mode"] = "airband_scan"
+    return payload
+
+
+def _send_airband_live_audio_block(handler: Handler, from_sample: int, requested_samples: int) -> None:
+    with state_lock:
+        running = refresh_airband_live_process_locked()
+        if not running:
+            handler.send_json({"error": "Live Airband audio is not running."}, HTTPStatus.CONFLICT)
+            return
+        available_samples = airband_live_available_samples()
+    if from_sample > available_samples:
+        handler.send_json({"error": "Requested cursor is beyond available Airband audio.", "available_samples": available_samples}, HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+        return
+    sample_count = min(requested_samples, available_samples - from_sample)
+    if sample_count < 1200:
+        handler.send_bytes(b"", "audio/wav", HTTPStatus.NO_CONTENT, {"X-Audio-Available-Samples": str(available_samples)})
+        return
+    with AIRBAND_LIVE_WAV_PATH.open("rb") as audio_file:
+        audio_file.seek(44 + from_sample * 2)
+        pcm_data = audio_file.read(sample_count * 2)
+    actual_samples = len(pcm_data) // 2
+    if actual_samples == 0:
+        handler.send_bytes(b"", "audio/wav", HTTPStatus.NO_CONTENT)
+        return
+    handler.send_bytes(wav_block_from_pcm(pcm_data), "audio/wav", extra_headers={
+        "X-Source-Samples": str(actual_samples),
+        "X-Audio-From-Sample": str(from_sample),
+        "X-Audio-Available-Samples": str(available_samples),
+    })
+
+
+_original_do_get = Handler.do_GET
+_original_do_post = Handler.do_POST
+_original_stop_child_on_shutdown = stop_child_on_shutdown
+
+
+def _normal_scanner_do_get(self: Handler) -> None:
+    request = urlparse(self.path)
+    if request.path == "/api/airband/scan/settings":
+        self.send_json({
+            "airband_scanner_settings": read_airband_scanner_settings(),
+            "blocked_frequencies_hz": read_airband_blocked_frequencies(),
+        })
+        return
+    if request.path == "/api/airband/scan/live/audio.wav":
+        parameters = parse_qs(request.query)
+        try:
+            from_sample = max(0, int(parameters.get("from", ["0"])[0]))
+            requested_samples = int(parameters.get("samples", ["12000"])[0])
+        except ValueError:
+            self.send_json({"error": "Invalid Airband audio cursor."}, HTTPStatus.BAD_REQUEST)
+            return
+        _send_airband_live_audio_block(self, from_sample, min(max(requested_samples, 1200), 48000))
+        return
+    _original_do_get(self)
+
+
+def _normal_scanner_do_post(self: Handler) -> None:
+    request = urlparse(self.path)
+    if request.path == "/api/airband/scan/settings":
+        payload = self.read_request_json()
+        if payload is None:
+            self.send_json({"error": "A JSON Airband scanner settings body is required."}, HTTPStatus.BAD_REQUEST)
+            return
+        settings = save_airband_scanner_settings(payload)
+        self.send_json({"saved": True, "airband_scanner_settings": settings, **build_status()})
+        return
+    if request.path == "/api/airband/scan/squelch/up":
+        settings = read_airband_scanner_settings()
+        settings["squelch_dbfs"] = float(settings["squelch_dbfs"]) + 2.0
+        settings = save_airband_scanner_settings(settings)
+        self.send_json({"saved": True, "airband_scanner_settings": settings, **build_status()})
+        return
+    if request.path == "/api/airband/scan/squelch/down":
+        settings = read_airband_scanner_settings()
+        settings["squelch_dbfs"] = float(settings["squelch_dbfs"]) - 2.0
+        settings = save_airband_scanner_settings(settings)
+        self.send_json({"saved": True, "airband_scanner_settings": settings, **build_status()})
+        return
+    if request.path == "/api/airband/scan/activity/skip":
+        airband_skip_event.set()
+        self.send_json({"accepted": True, "command": "skip", **build_status()})
+        return
+    if request.path == "/api/airband/scan/activity/block":
+        payload = self.read_request_json() or {}
+        frequency_hz = None
+        try:
+            if payload.get("frequency_hz") is not None:
+                frequency_hz = int(payload["frequency_hz"])
+        except (TypeError, ValueError):
+            frequency_hz = None
+        if frequency_hz is None:
+            with state_lock:
+                channel = runtime_state.get("airband_locked_channel") or runtime_state.get("airband_current_channel")
+            if isinstance(channel, dict):
+                frequency_hz = int(channel.get("frequency_hz", 0))
+        if frequency_hz is None or not (118000000 <= frequency_hz <= 137000000):
+            self.send_json({"error": "No valid Airband frequency is currently selected to block."}, HTTPStatus.CONFLICT)
+            return
+        blocked = read_airband_blocked_frequencies()
+        if frequency_hz not in blocked:
+            blocked.append(frequency_hz)
+        saved = save_airband_blocked_frequencies(blocked)
+        airband_skip_event.set()
+        self.send_json({"blocked": True, "frequency_hz": frequency_hz, "blocked_frequencies_hz": saved, **build_status()})
+        return
+    if request.path == "/api/airband/scan/activity/start":
+        parameters = parse_qs(request.query)
+        scope = parameters.get("scope", ["all"])[0]
+        if scope not in ("continuous", "priority", "all"):
+            scope = "all"
+        try:
+            frequency_text = parameters.get("frequency_hz", [""])[0]
+            watch_frequency_hz = int(frequency_text) if frequency_text else None
+        except ValueError:
+            self.send_json({"error": "Invalid watch frequency."}, HTTPStatus.BAD_REQUEST)
+            return
+        airband_skip_event.clear()
+        self.start_airband_activity_scan(scope, watch_frequency_hz)
+        return
+    if request.path == "/api/airband/scan/activity/stop":
+        airband_skip_event.set()
+        self.stop_airband_activity_scan()
+        return
+    _original_do_post(self)
+
+
+def stop_child_on_shutdown() -> None:
+    airband_scan_stop_event.set()
+    airband_skip_event.set()
+    with state_lock:
+        stop_airband_live_process_locked()
+    _original_stop_child_on_shutdown()
+
+
+Handler.do_GET = _normal_scanner_do_get
+Handler.do_POST = _normal_scanner_do_post
+# --- end Airband normal scanner patch v1 ---
+
+
+
+# AIRBAND_SPECTRUM_CANDIDATES_PATCH_V1
+# Experimental fast RF spectrum candidate scanner. This is intentionally kept
+# separate from the proven sequential live scanner until the candidate data is
+# validated on real hardware.
+AIRBAND_SPECTRUM_BINARY = Path(
+    os.environ.get(
+        "RTL_PI_AIRBAND_SPECTRUM_BINARY",
+        "/opt/rtl-pi-adsb-tracker/bin/rtl_airband_spectrum_scan",
+    )
+)
+AIRBAND_SPECTRUM_JSON_PATH = OUTPUT_DIR / "airband_spectrum_candidates.json"
+
+
+def _airband_spectrum_float_param(parameters: dict, name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(parameters.get(name, [str(default)])[0])
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+def _airband_spectrum_int_param(parameters: dict, name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(parameters.get(name, [str(default)])[0])
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+def _airband_spectrum_match_channel(candidate: dict, channels: list[dict]) -> dict | None:
+    try:
+        frequency_hz = int(candidate.get("frequency_hz"))
+    except (TypeError, ValueError):
+        return None
+
+    best_channel = None
+    best_delta = 999999999
+    for channel in channels:
+        try:
+            channel_frequency_hz = int(channel.get("frequency_hz"))
+        except (TypeError, ValueError):
+            continue
+        delta = abs(channel_frequency_hz - frequency_hz)
+        if delta < best_delta:
+            best_delta = delta
+            best_channel = channel
+
+    if best_channel is not None and best_delta <= 12500:
+        return best_channel
+    return None
+
+
+def _airband_spectrum_candidates_payload(query: str) -> tuple[dict, HTTPStatus]:
+    parameters = parse_qs(query)
+
+    if not AIRBAND_SPECTRUM_BINARY.exists():
+        return {
+            "error": "Airband spectrum scanner binary is not deployed.",
+            "binary": str(AIRBAND_SPECTRUM_BINARY),
+        }, HTTPStatus.SERVICE_UNAVAILABLE
+
+    start_hz = _airband_spectrum_int_param(parameters, "start_hz", 118000000, 118000000, 136000000)
+    end_hz = _airband_spectrum_int_param(parameters, "end_hz", 137000000, start_hz + 100000, 137000000)
+    sample_rate = _airband_spectrum_int_param(parameters, "sample_rate", 2048000, 1000000, 3200000)
+    step_hz = _airband_spectrum_int_param(parameters, "step_hz", 25000, 5000, 100000)
+    dwell_ms = _airband_spectrum_int_param(parameters, "dwell_ms", 80, 20, 2000)
+    top_n = _airband_spectrum_int_param(parameters, "top_n", 20, 1, 200)
+    gain_db = _airband_spectrum_float_param(parameters, "gain_db", float(RF_GAIN_DB), 0.0, 49.6)
+
+    if not receiver_lock.acquire(blocking=False):
+        return {"error": "Audio receiver is currently busy."}, HTTPStatus.CONFLICT
+
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        safe_unlink(AIRBAND_SPECTRUM_JSON_PATH)
+
+        command = [
+            str(AIRBAND_SPECTRUM_BINARY),
+            "--serial",
+            AUDIO_SERIAL,
+            "--start-hz",
+            str(start_hz),
+            "--end-hz",
+            str(end_hz),
+            "--sample-rate",
+            str(sample_rate),
+            "--step-hz",
+            str(step_hz),
+            "--dwell-ms",
+            str(dwell_ms),
+            "--gain-db",
+            f"{gain_db:.1f}",
+            "--top-n",
+            str(top_n),
+            "--json-output",
+            str(AIRBAND_SPECTRUM_JSON_PATH),
+        ]
+
+        started_utc = int(time.time())
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=max(30, int(((end_hz - start_hz) / max(1, sample_rate - 150000)) + 2) * (dwell_ms / 1000.0 + 2.0) + 30),
+            check=False,
+        )
+
+        if result.returncode != 0:
+            return {
+                "error": "Airband spectrum scan failed.",
+                "returncode": result.returncode,
+                "stdout": result.stdout[-4000:],
+                "stderr": result.stderr[-4000:],
+                "command": command,
+            }, HTTPStatus.INTERNAL_SERVER_ERROR
+
+        payload = read_json(AIRBAND_SPECTRUM_JSON_PATH)
+        if not payload:
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                return {
+                    "error": "Airband spectrum scanner did not return JSON.",
+                    "stdout": result.stdout[-4000:],
+                    "stderr": result.stderr[-4000:],
+                }, HTTPStatus.INTERNAL_SERVER_ERROR
+
+        location = read_receiver_location()
+        nearby_channels = []
+        if location is not None:
+            nearby = nearby_airband_channels(location)
+            if isinstance(nearby, dict) and isinstance(nearby.get("channels"), list):
+                nearby_channels = nearby["channels"]
+
+        blocked = set()
+        try:
+            blocked = set(read_airband_blocked_frequencies())
+        except NameError:
+            blocked = set()
+
+        enriched_candidates = []
+        for candidate in payload.get("candidates", []):
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                candidate_frequency_hz = int(candidate.get("frequency_hz"))
+            except (TypeError, ValueError):
+                continue
+
+            enriched = dict(candidate)
+            enriched["blocked"] = candidate_frequency_hz in blocked
+            matched_channel = _airband_spectrum_match_channel(enriched, nearby_channels)
+            enriched["matched_channel"] = matched_channel
+            enriched["known_channel_match"] = matched_channel is not None
+            enriched_candidates.append(enriched)
+
+        payload["candidates"] = enriched_candidates
+        payload["candidate_count"] = len(enriched_candidates)
+        payload["started_utc"] = started_utc
+        payload["completed_utc"] = int(time.time())
+        payload["receiver_location"] = location
+        payload["audio_receiver_serial"] = AUDIO_SERIAL
+        payload["binary"] = str(AIRBAND_SPECTRUM_BINARY)
+
+        return payload, HTTPStatus.OK
+
+    finally:
+        receiver_lock.release()
+
+
+_original_airband_spectrum_do_get = Handler.do_GET
+
+
+def _airband_spectrum_do_get(self) -> None:
+    request = urlparse(self.path)
+    if request.path == "/api/airband/spectrum/candidates":
+        payload, status = _airband_spectrum_candidates_payload(request.query)
+        self.send_json(payload, status)
+        return
+    return _original_airband_spectrum_do_get(self)
+
+
+Handler.do_GET = _airband_spectrum_do_get
+# /AIRBAND_SPECTRUM_CANDIDATES_PATCH_V1
+
+
+# AIRBAND_FAST_SPECTRUM_WORKER_PATCH_V1
+import urllib.parse  # AIRBAND_FAST_SPECTRUM_URLENCODE_FIX_V1
+# Replace the normal Airband scanner worker with a spectrum-first worker.
+# Keep the previous worker as fallback.
+_airband_sequential_scan_worker_fallback = airband_scan_worker
+
+
+def _fast_spectrum_channel_for_candidate(candidate: dict, channels: list[dict]) -> dict | None:
+    matched = candidate.get("matched_channel")
+    if isinstance(matched, dict) and matched.get("frequency_hz") is not None:
+        return matched
+
+    try:
+        candidate_frequency_hz = int(candidate.get("frequency_hz"))
+    except (TypeError, ValueError):
+        return None
+
+    best_channel = None
+    best_delta = 999999999
+    for channel in channels:
+        try:
+            channel_frequency_hz = int(channel.get("frequency_hz"))
+        except (TypeError, ValueError):
+            continue
+        delta = abs(channel_frequency_hz - candidate_frequency_hz)
+        if delta < best_delta:
+            best_delta = delta
+            best_channel = channel
+
+    if best_channel is not None and best_delta <= 12500:
+        return best_channel
+    return None
+
+
+# AIRBAND_FAST_SPECTRUM_LOCK_CONTENTION_FIX_V1
+def _fast_spectrum_candidates_once(settings: dict, channels: list[dict]) -> dict:
+    # Run one fast-spectrum sweep from inside the scanner worker.
+    #
+    # This intentionally does not call _airband_spectrum_candidates_payload(),
+    # because the worker already owns receiver_lock and that API helper tries to
+    # acquire the same lock again.
+    if not AIRBAND_SPECTRUM_BINARY.exists():
+        return {
+            "ok": False,
+            "error": f"Spectrum binary is not deployed: {AIRBAND_SPECTRUM_BINARY}",
+            "payload": {},
+        }
+
+    start_hz = 118000000
+    end_hz = 137000000
+
+    frequencies = []
+    for channel in channels:
+        try:
+            frequencies.append(int(channel.get("frequency_hz")))
+        except (TypeError, ValueError):
+            continue
+
+    if frequencies:
+        start_hz = max(118000000, min(frequencies) - 250000)
+        end_hz = min(137000000, max(frequencies) + 250000)
+
+    dwell_ms = max(40, int(settings.get("sample_ms", 250)) // 3)
+    gain_db = float(settings.get("rf_gain_db", RF_GAIN_DB))
+    top_n = 40
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    safe_unlink(AIRBAND_SPECTRUM_JSON_PATH)
+
+    command = [
+        str(AIRBAND_SPECTRUM_BINARY),
+        "--serial",
+        AUDIO_SERIAL,
+        "--start-hz",
+        str(start_hz),
+        "--end-hz",
+        str(end_hz),
+        "--sample-rate",
+        "2048000",
+        "--step-hz",
+        "25000",
+        "--dwell-ms",
+        str(dwell_ms),
+        "--gain-db",
+        f"{gain_db:.1f}",
+        "--top-n",
+        str(top_n),
+        "--json-output",
+        str(AIRBAND_SPECTRUM_JSON_PATH),
+    ]
+
+    started_utc = int(time.time())
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=max(
+                30,
+                int(((end_hz - start_hz) / max(1, 2048000 - 150000)) + 2)
+                * (dwell_ms / 1000.0 + 2.0)
+                + 30,
+            ),
+            check=False,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "payload": {"command": command}}
+
+    if result.returncode != 0:
+        return {
+            "ok": False,
+            "error": result.stderr.strip() or result.stdout.strip() or "Spectrum scan failed.",
+            "payload": {
+                "returncode": result.returncode,
+                "stdout": result.stdout[-4000:],
+                "stderr": result.stderr[-4000:],
+                "command": command,
+            },
+        }
+
+    payload = read_json(AIRBAND_SPECTRUM_JSON_PATH)
+    if not payload:
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return {
+                "ok": False,
+                "error": "Spectrum scanner did not return JSON.",
+                "payload": {
+                    "stdout": result.stdout[-4000:],
+                    "stderr": result.stderr[-4000:],
+                    "command": command,
+                },
+            }
+
+    blocked = set(read_airband_blocked_frequencies())
+
+    enriched_candidates = []
+    for candidate in payload.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+
+        try:
+            frequency_hz = int(candidate.get("frequency_hz"))
+        except (TypeError, ValueError):
+            continue
+
+        enriched = dict(candidate)
+        enriched["blocked"] = frequency_hz in blocked
+        matched_channel = _fast_spectrum_channel_for_candidate(enriched, channels)
+        enriched["matched_channel"] = matched_channel
+        enriched["known_channel_match"] = matched_channel is not None
+        enriched_candidates.append(enriched)
+
+    payload["candidates"] = enriched_candidates
+    payload["candidate_count"] = len(enriched_candidates)
+    payload["started_utc"] = started_utc
+    payload["completed_utc"] = int(time.time())
+    payload["audio_receiver_serial"] = AUDIO_SERIAL
+    payload["binary"] = str(AIRBAND_SPECTRUM_BINARY)
+    payload["source"] = "scanner_worker_no_relock"
+
+    return {"ok": True, "payload": payload}
+
+
+def _select_fast_spectrum_candidate(spectrum_payload: dict, settings: dict, channels: list[dict]) -> tuple[dict | None, dict | None]:
+    blocked = set(read_airband_blocked_frequencies())
+    snr_threshold = float(settings.get("snr_threshold_db", 6.0))
+    channel_frequency_set = set()
+    for channel in channels:
+        try:
+            channel_frequency_set.add(int(channel.get("frequency_hz")))
+        except (TypeError, ValueError):
+            continue
+
+    best_channel = None
+    best_candidate = None
+
+    for candidate in spectrum_payload.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            candidate_frequency_hz = int(candidate.get("frequency_hz"))
+            candidate_snr = float(candidate.get("estimated_snr_db", -999.0))
+        except (TypeError, ValueError):
+            continue
+
+        if candidate_frequency_hz in blocked or candidate_snr < snr_threshold:
+            continue
+
+        channel = _fast_spectrum_channel_for_candidate(candidate, channels)
+        if channel is None:
+            continue
+
+        try:
+            channel_frequency_hz = int(channel.get("frequency_hz"))
+        except (TypeError, ValueError):
+            continue
+
+        if channel_frequency_set and channel_frequency_hz not in channel_frequency_set:
+            continue
+        if channel_frequency_hz in blocked:
+            continue
+
+        best_channel = channel
+        best_candidate = candidate
+        break
+
+    return best_channel, best_candidate
+
+
+def airband_scan_worker(channels: list[dict]) -> None:
+    global airband_scan_thread
+
+    # If the spectrum binary/helper is not present for any reason, use the proven
+    # sequential scanner without breaking normal operation.
+    if "AIRBAND_SPECTRUM_BINARY" not in globals() or not AIRBAND_SPECTRUM_BINARY.exists():
+        _airband_sequential_scan_worker_fallback(channels)
+        return
+
+    try:
+        with state_lock:
+            runtime_state["airband_scan_state"] = "spectrum_search"
+            runtime_state["airband_scanner_message"] = "Fast spectrum Airband scanner starting."
+
+        while not airband_scan_stop_event.is_set():
+            settings = read_airband_scanner_settings()
+            blocked = set(read_airband_blocked_frequencies())
+            active_channels = [
+                channel for channel in channels
+                if int(channel.get("frequency_hz", 0)) not in blocked
+            ]
+
+            if not active_channels:
+                with state_lock:
+                    runtime_state["airband_scan_state"] = "blocked_all"
+                    runtime_state["airband_scanner_message"] = "All candidate Airband frequencies are blocked."
+                time.sleep(1.0)
+                continue
+
+            with state_lock:
+                runtime_state["airband_scan_running"] = True
+                runtime_state["airband_scan_state"] = "spectrum_search"
+                runtime_state["airband_scan_cycles"] = int(runtime_state.get("airband_scan_cycles", 0)) + 1
+                runtime_state["airband_locked_channel"] = None
+                runtime_state["airband_silence_remaining"] = None
+                runtime_state["airband_scanner_message"] = (
+                    f"Fast spectrum sweep across {len(active_channels)} Airband frequencies."
+                )
+
+            spectrum_result = _fast_spectrum_candidates_once(settings, active_channels)
+            if not spectrum_result.get("ok"):
+                with state_lock:
+                    runtime_state["airband_scan_state"] = "spectrum_error"
+                    runtime_state["airband_scan_error"] = spectrum_result.get("error")
+                    runtime_state["airband_scanner_message"] = (
+                        f"Spectrum scan failed; using sequential fallback: {spectrum_result.get('error')}"
+                    )
+                _airband_sequential_scan_worker_fallback(channels)
+                return
+
+            spectrum_payload = spectrum_result["payload"]
+            best_channel, best_candidate = _select_fast_spectrum_candidate(
+                spectrum_payload,
+                settings,
+                active_channels,
+            )
+
+            with state_lock:
+                runtime_state["airband_spectrum_last_scan"] = spectrum_payload
+                runtime_state["airband_channels_scanned"] = int(runtime_state.get("airband_channels_scanned", 0)) + int(spectrum_payload.get("candidate_count", 0))
+
+            if best_channel is None or best_candidate is None:
+                top = None
+                for candidate in spectrum_payload.get("candidates", []):
+                    if isinstance(candidate, dict):
+                        top = candidate
+                        break
+                with state_lock:
+                    runtime_state["airband_scan_state"] = "spectrum_search"
+                    runtime_state["airband_current_channel"] = None
+                    runtime_state["airband_last_signal_snr_db"] = (
+                        round(float(top.get("estimated_snr_db")), 2)
+                        if isinstance(top, dict) and top.get("estimated_snr_db") is not None
+                        else None
+                    )
+                    runtime_state["airband_scanner_message"] = (
+                        "Fast spectrum sweep found no known unblocked channel above threshold."
+                    )
+                time.sleep(0.25)
+                continue
+
+            candidate_snr = float(best_candidate.get("estimated_snr_db", 0.0))
+            candidate_power = float(best_candidate.get("power_db", -120.0))
+
+            detection = {
+                "channel": best_channel,
+                "audio_rms_dbfs": None,
+                "rf_estimated_snr_db": round(candidate_snr, 2),
+                "rf_power_db": round(candidate_power, 2),
+                "threshold_snr_db": settings["snr_threshold_db"],
+                "squelch_dbfs": settings["squelch_dbfs"],
+                "detected_utc": int(time.time()),
+                "source": "fast_spectrum",
+                "audio_url": "/api/airband/scan/live/audio.wav",
+            }
+
+            with state_lock:
+                runtime_state["airband_current_channel"] = best_channel
+                runtime_state["airband_last_detection"] = detection
+                runtime_state["airband_last_signal_snr_db"] = round(candidate_snr, 2)
+                runtime_state["airband_last_measurement_dbfs"] = round(candidate_power, 2)
+                runtime_state["airband_locked_channel"] = best_channel
+                runtime_state["airband_scan_state"] = "locked"
+                runtime_state["airband_lock_reason"] = "fast_spectrum_activity_detected"
+                runtime_state["airband_scanner_message"] = (
+                    f"Fast spectrum locked on {best_channel['frequency_mhz']:.3f} MHz."
+                )
+                start_airband_live_process_locked(best_channel, settings)
+
+            monitor_airband_locked_channel(best_channel, settings)
+
+            with state_lock:
+                if not airband_scan_stop_event.is_set():
+                    runtime_state["airband_scan_state"] = "spectrum_search"
+                    runtime_state["airband_locked_channel"] = None
+                    runtime_state["airband_scanner_message"] = "Resuming fast spectrum Airband scan."
+
+    except Exception as exc:
+        with state_lock:
+            runtime_state["airband_scan_error"] = str(exc)
+            runtime_state["airband_scan_state"] = "error"
+            runtime_state["airband_scanner_message"] = f"Fast spectrum scanner error: {exc}"
+    finally:
+        with state_lock:
+            stop_airband_live_process_locked()
+            if airband_scan_stop_event.is_set():
+                runtime_state["airband_scan_state"] = "stopped"
+                runtime_state["airband_scanner_message"] = "Airband scanner stopped."
+            elif runtime_state.get("airband_scan_state") != "error":
+                runtime_state["airband_scan_state"] = "idle"
+                runtime_state["airband_scanner_message"] = "Airband scanner idle."
+            runtime_state["airband_scan_running"] = False
+            runtime_state["airband_locked_channel"] = None
+            runtime_state["airband_silence_remaining"] = None
+        if receiver_lock.locked():
+            receiver_lock.release()
+        airband_scan_thread = None
+
+# /AIRBAND_FAST_SPECTRUM_WORKER_PATCH_V1
+
+
+# AIRBAND_FAST_SPECTRUM_SKIP_LOCKOUT_PATCH_V1
+# Temporary skip lockout for fast-spectrum Airband scanner.
+#
+# Skip should behave like a scanner SKIP/Nuisance Delete action: leave the
+# current open frequency and do not immediately re-lock it on the next spectrum
+# sweep. Block remains the permanent blacklist action.
+AIRBAND_SKIP_LOCKOUT_SECONDS = int(os.environ.get("RTL_PI_AIRBAND_SKIP_LOCKOUT_SECONDS", "120"))
+runtime_state.setdefault("airband_skip_lockouts", {})
+
+
+def _airband_skip_lockout_cleanup() -> dict:
+    now = time.time()
+    lockouts = runtime_state.get("airband_skip_lockouts")
+    if not isinstance(lockouts, dict):
+        lockouts = {}
+    clean = {}
+    for key, expires_at in lockouts.items():
+        try:
+            frequency_hz = int(key)
+            expires = float(expires_at)
+        except (TypeError, ValueError):
+            continue
+        if expires > now:
+            clean[str(frequency_hz)] = expires
+    runtime_state["airband_skip_lockouts"] = clean
+    return clean
+
+
+def _airband_skip_lockout_frequencies() -> set[int]:
+    lockouts = _airband_skip_lockout_cleanup()
+    frequencies = set()
+    for key in lockouts:
+        try:
+            frequencies.add(int(key))
+        except (TypeError, ValueError):
+            continue
+    return frequencies
+
+
+def _airband_skip_lockout_add(frequency_hz: int, seconds: int | None = None) -> dict:
+    if seconds is None:
+        seconds = AIRBAND_SKIP_LOCKOUT_SECONDS
+    lockouts = _airband_skip_lockout_cleanup()
+    lockouts[str(int(frequency_hz))] = time.time() + max(1, int(seconds))
+    runtime_state["airband_skip_lockouts"] = lockouts
+    return lockouts
+
+
+def _airband_current_frequency_for_skip() -> int | None:
+    candidates = []
+    with state_lock:
+        candidates.append(runtime_state.get("airband_locked_channel"))
+        candidates.append(runtime_state.get("airband_current_channel"))
+        detection = runtime_state.get("airband_last_detection")
+        if isinstance(detection, dict):
+            candidates.append(detection.get("channel"))
+
+    for channel in candidates:
+        if not isinstance(channel, dict):
+            continue
+        try:
+            frequency_hz = int(channel.get("frequency_hz"))
+        except (TypeError, ValueError):
+            continue
+        if 118000000 <= frequency_hz <= 137000000:
+            return frequency_hz
+    return None
+
+
+# Replace candidate selection so temporary skip lockouts are treated like a
+# short-lived block list during fast spectrum selection.
+def _select_fast_spectrum_candidate(spectrum_payload: dict, settings: dict, channels: list[dict]) -> tuple[dict | None, dict | None]:
+    blocked = set(read_airband_blocked_frequencies())
+    skipped = _airband_skip_lockout_frequencies()
+    snr_threshold = float(settings.get("snr_threshold_db", 6.0))
+    channel_frequency_set = set()
+    for channel in channels:
+        try:
+            channel_frequency_set.add(int(channel.get("frequency_hz")))
+        except (TypeError, ValueError):
+            continue
+
+    for candidate in spectrum_payload.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            candidate_frequency_hz = int(candidate.get("frequency_hz"))
+            candidate_snr = float(candidate.get("estimated_snr_db", -999.0))
+        except (TypeError, ValueError):
+            continue
+
+        if candidate_frequency_hz in blocked or candidate_frequency_hz in skipped:
+            continue
+        if candidate_snr < snr_threshold:
+            continue
+
+        channel = _fast_spectrum_channel_for_candidate(candidate, channels)
+        if channel is None:
+            continue
+
+        try:
+            channel_frequency_hz = int(channel.get("frequency_hz"))
+        except (TypeError, ValueError):
+            continue
+
+        if channel_frequency_set and channel_frequency_hz not in channel_frequency_set:
+            continue
+        if channel_frequency_hz in blocked or channel_frequency_hz in skipped:
+            continue
+
+        return channel, candidate
+
+    return None, None
+
+
+_original_airband_skip_lockout_do_post = Handler.do_POST
+
+
+def _airband_skip_lockout_do_post(self) -> None:
+    request = urlparse(self.path)
+
+    if request.path == "/api/airband/scan/activity/skip":
+        frequency_hz = _airband_current_frequency_for_skip()
+        airband_skip_event.set()
+
+        payload = {
+            "accepted": True,
+            "command": "skip",
+            "skip_lockout_seconds": AIRBAND_SKIP_LOCKOUT_SECONDS,
+            "skip_frequency_hz": frequency_hz,
+        }
+
+        if frequency_hz is not None:
+            lockouts = _airband_skip_lockout_add(frequency_hz)
+            payload["airband_skip_lockouts"] = lockouts
+            payload["message"] = (
+                f"Skipped {frequency_hz / 1000000.0:.3f} MHz for "
+                f"{AIRBAND_SKIP_LOCKOUT_SECONDS} seconds."
+            )
+            with state_lock:
+                runtime_state["airband_scanner_message"] = payload["message"]
+        else:
+            payload["message"] = "Skip accepted; no current Airband frequency was available to lock out."
+
+        payload.update(build_status())
+        self.send_json(payload)
+        return
+
+    return _original_airband_skip_lockout_do_post(self)
+
+
+Handler.do_POST = _airband_skip_lockout_do_post
+
+
+_original_airband_skip_lockout_build_status = build_status
+
+
+def build_status() -> dict:
+    payload = _original_airband_skip_lockout_build_status()
+    payload["airband_skip_lockouts"] = _airband_skip_lockout_cleanup()
+    payload["airband_skip_lockout_seconds"] = AIRBAND_SKIP_LOCKOUT_SECONDS
+    return payload
+
+# /AIRBAND_FAST_SPECTRUM_SKIP_LOCKOUT_PATCH_V1
+
 if __name__ == "__main__":
     main()

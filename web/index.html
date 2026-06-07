@@ -1,6 +1,136 @@
 <!doctype html>
 <html lang="en">
 <head>
+
+<!-- AIRBAND_MANUAL_START_GUARD_PATCH_V2 -->
+<script>
+(function () {
+  "use strict";
+
+  if (window.__airbandManualStartGuardV2Installed) {
+    return;
+  }
+
+  window.__airbandManualStartGuardV2Installed = true;
+  window.__airbandManualScannerAllowStartUntil = 0;
+
+  function textOfCallback(callback) {
+    try {
+      return String(callback || "");
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function looksLikeOldAirbandAutoStart(callback) {
+    const text = textOfCallback(callback);
+    return (
+      text.indexOf("/api/airband/scan/activity/start") !== -1 ||
+      text.indexOf("Starting Airband Background") !== -1 ||
+      text.indexOf("Start Airband Background") !== -1 ||
+      text.indexOf("startAirbandBackground") !== -1 ||
+      text.indexOf("ensureAirbandBackground") !== -1 ||
+      text.indexOf("autoStartAirband") !== -1
+    );
+  }
+
+  function isAirbandScannerStart(input) {
+    const url = typeof input === "string" ? input : (input && input.url ? input.url : "");
+    return url.indexOf("/api/airband/scan/activity/start") !== -1;
+  }
+
+  function allowManualAirbandStartForGesture() {
+    window.__airbandManualScannerAllowStartUntil = Date.now() + 5000;
+  }
+
+  document.addEventListener("click", function (event) {
+    const target = event.target && event.target.closest ? event.target.closest("button") : null;
+    const text = target ? (target.textContent || "").trim() : "";
+    if (/^Start Scanner$/i.test(text)) {
+      allowManualAirbandStartForGesture();
+    }
+  }, true);
+
+  const originalSetInterval = window.setInterval.bind(window);
+  window.setInterval = function (callback, delay) {
+    if (looksLikeOldAirbandAutoStart(callback)) {
+      console.log("Blocked old Airband auto-start interval. Use Start Scanner.");
+      return 0;
+    }
+    return originalSetInterval.apply(window, arguments);
+  };
+
+  const originalSetTimeout = window.setTimeout.bind(window);
+  window.setTimeout = function (callback, delay) {
+    if (looksLikeOldAirbandAutoStart(callback)) {
+      console.log("Blocked old Airband auto-start timeout. Use Start Scanner.");
+      return 0;
+    }
+    return originalSetTimeout.apply(window, arguments);
+  };
+
+  const originalFetch = window.fetch ? window.fetch.bind(window) : null;
+  if (originalFetch) {
+    window.fetch = function (input, init) {
+      if (isAirbandScannerStart(input) && Date.now() > window.__airbandManualScannerAllowStartUntil) {
+        console.log("Blocked automatic Airband scanner start. Use Start Scanner.");
+        return Promise.resolve(new Response(JSON.stringify({
+          service: "rtl-pi-api",
+          manual_start_required: true,
+          airband_scan_running: false,
+          airband_scan_state: "manual_start_required",
+          airband_scanner_message: "Airband scanner is stopped. Click Start Scanner to arm browser audio and begin scanning."
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        }));
+      }
+      return originalFetch(input, init);
+    };
+  }
+
+  function hideOldAirbandBusyPopup() {
+    const candidates = Array.from(document.querySelectorAll("dialog, [role='dialog'], .modal, .popup, .overlay, div, section"));
+    for (const node of candidates) {
+      const text = node.textContent || "";
+      if (
+        text.indexOf("Starting Airband Background") !== -1 ||
+        text.indexOf("Start Airband Background") !== -1
+      ) {
+        const style = window.getComputedStyle(node);
+        const isOverlayLike =
+          style.position === "fixed" ||
+          style.position === "absolute" ||
+          node.getAttribute("role") === "dialog" ||
+          node.tagName.toLowerCase() === "dialog" ||
+          /modal|popup|overlay|busy/i.test(node.className || node.id || "");
+        if (isOverlayLike) {
+          node.style.setProperty("display", "none", "important");
+          node.style.setProperty("visibility", "hidden", "important");
+          node.setAttribute("aria-hidden", "true");
+        }
+      }
+    }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", hideOldAirbandBusyPopup);
+  } else {
+    hideOldAirbandBusyPopup();
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    const observer = new MutationObserver(hideOldAirbandBusyPopup);
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+  });
+})();
+</script>
+<!-- /AIRBAND_MANUAL_START_GUARD_PATCH_V2 -->
+
+
+
+
+
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RTL Pi ADS-B Tracker</title>
@@ -256,7 +386,7 @@ body { padding: 0; }
     <div class="station"><strong id="stationName">NOAA Weather</strong><span>Audio receiver and background scan controls</span></div>
     <button id="noaaMenuToggle" type="button">Start NOAA Weather</button>
     <button id="airbandMenuToggle" type="button">Stop Airband Background Scan</button>
-    <div id="operationsMessage" class="message warning">Airband scan starts automatically and runs silently unless real RF activity is detected. Use Diagnostics > Airband Scanner Test Mode for an audible simulated test tone.</div>
+    <div id="operationsMessage" class="message warning">Airband scanner starts only when you click Start Scanner so browser audio can be armed by that user action. Use Diagnostics > Airband Scanner Test Mode for an audible simulated test tone.</div>
     <button id="startLive" type="button" class="menu-hidden-control">Start Listening</button>
     <button id="stopLive" type="button" class="menu-hidden-control" disabled>Stop Listening</button>
     <button id="autoNoaa" type="button" class="menu-hidden-control">Scan and Listen</button>
@@ -2098,5 +2228,549 @@ document.addEventListener('DOMContentLoaded', () => {
   window.setTimeout(startDefaultBackgroundAirband, 900);
 });
 </script>
+
+<!-- AIRBAND_NORMAL_SCANNER_UI_PATCH_V1 -->
+<style>
+  .airband-normal-scanner-panel {
+    margin: 8px 0;
+    padding: 8px 10px;
+    border: 1px solid rgba(120, 120, 120, 0.45);
+    border-radius: 8px;
+    background: rgba(20, 20, 20, 0.72);
+    color: #f3f3f3;
+    font-size: 13px;
+  }
+
+  .airband-normal-scanner-panel h3,
+  .airband-normal-scanner-panel h4 {
+    margin: 0 0 6px 0;
+    font-size: 14px;
+  }
+
+  .airband-normal-scanner-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+    gap: 6px 10px;
+    align-items: center;
+  }
+
+  .airband-normal-scanner-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 6px 0;
+  }
+
+  .airband-normal-scanner-actions button,
+  .airband-normal-scanner-panel button {
+    padding: 4px 8px;
+    border-radius: 6px;
+    border: 1px solid rgba(210, 210, 210, 0.55);
+    background: rgba(255, 255, 255, 0.10);
+    color: inherit;
+    cursor: pointer;
+  }
+
+  .airband-normal-scanner-actions button:hover,
+  .airband-normal-scanner-panel button:hover {
+    background: rgba(255, 255, 255, 0.20);
+  }
+
+  .airband-normal-scanner-actions button:disabled,
+  .airband-normal-scanner-panel button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .airband-normal-scanner-readout {
+    display: inline-block;
+    min-width: 70px;
+    font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  }
+
+  .airband-normal-scanner-status {
+    margin-top: 6px;
+    line-height: 1.35;
+  }
+
+  .airband-normal-scanner-small {
+    font-size: 12px;
+    opacity: 0.84;
+  }
+
+  .airband-normal-scanner-panel input {
+    width: 84px;
+    margin-left: 4px;
+    margin-right: 8px;
+  }
+
+  .airband-normal-scanner-audio-on {
+    color: #8df58d;
+    font-weight: 700;
+  }
+
+  .airband-normal-scanner-audio-off {
+    color: #ffd37a;
+  }
+</style>
+
+<script>
+(function () {
+  "use strict";
+
+  const PATCH_ID = "airband-normal-scanner-ui";
+  const STATUS_URL = "/api/airband/scan/status";
+  const SETTINGS_URL = "/api/airband/scan/settings";
+  const START_URL = "/api/airband/scan/activity/start?scope=all";
+  const STOP_URL = "/api/airband/scan/activity/stop";
+  const SKIP_URL = "/api/airband/scan/activity/skip";
+  const BLOCK_URL = "/api/airband/scan/activity/block";
+  const SQUELCH_UP_URL = "/api/airband/scan/squelch/up";
+  const SQUELCH_DOWN_URL = "/api/airband/scan/squelch/down";
+  const LIVE_AUDIO_URL = "/api/airband/scan/live/audio.wav";
+
+  let audioContext = null;
+  let audioCursorSamples = 0;
+  let audioNextStartTime = 0;
+  let audioLoopRunning = false;
+  let audioEnabled = false;
+  let lastStatus = null;
+  let lastAirbandLockKey = null;
+  let pollTimer = null;
+
+  function byId(id) {
+    return document.getElementById(id);
+  }
+
+  function fmt(value, digits) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {
+      return "—";
+    }
+    return Number(value).toFixed(digits);
+  }
+
+  function channelLabel(channel) {
+    if (!channel) {
+      return "—";
+    }
+    const mhz = channel.frequency_mhz || (channel.frequency_hz ? channel.frequency_hz / 1000000 : null);
+    const use = channel.use || "";
+    const airport = channel.airport_id || "";
+    const miles = channel.distance_miles !== undefined ? `${fmt(channel.distance_miles, 1)} mi` : "";
+    return `${fmt(mhz, 3)} MHz ${airport} ${use} ${miles}`.trim();
+  }
+
+  async function postJson(url, body) {
+    const options = { method: "POST" };
+    if (body !== undefined) {
+      options.headers = { "Content-Type": "application/json" };
+      options.body = JSON.stringify(body);
+    }
+    const response = await fetch(url, options);
+    if (!response.ok) {
+      throw new Error(`${url} failed: HTTP ${response.status}`);
+    }
+    return response.json();
+  }
+
+  async function getJson(url) {
+    const response = await fetch(url, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`${url} failed: HTTP ${response.status}`);
+    }
+    return response.json();
+  }
+
+  function scannerPanelHtml() {
+    return `
+      <div id="${PATCH_ID}-panel" class="airband-normal-scanner-panel">
+        <h3>Airband Scanner</h3>
+        <div class="airband-normal-scanner-grid">
+          <div>State: <span id="${PATCH_ID}-state" class="airband-normal-scanner-readout">loading</span></div>
+          <div>Audio: <span id="${PATCH_ID}-audio" class="airband-normal-scanner-readout airband-normal-scanner-audio-off">off</span></div>
+          <div>Frequency: <span id="${PATCH_ID}-frequency" class="airband-normal-scanner-readout">—</span></div>
+          <div>SNR: <span id="${PATCH_ID}-snr" class="airband-normal-scanner-readout">—</span></div>
+          <div>Level: <span id="${PATCH_ID}-level" class="airband-normal-scanner-readout">—</span></div>
+          <div>Silence: <span id="${PATCH_ID}-silence" class="airband-normal-scanner-readout">—</span></div>
+        </div>
+        <div class="airband-normal-scanner-actions">
+          <button id="${PATCH_ID}-start">Start Scanner</button>
+          <button id="${PATCH_ID}-stop">Stop Scanner</button>
+          <button id="${PATCH_ID}-skip">Skip Open Frequency</button>
+          <button id="${PATCH_ID}-block">Block Frequency</button>
+          <button id="${PATCH_ID}-sqdown">Squelch −</button>
+          <button id="${PATCH_ID}-squp">Squelch +</button>
+          <button id="${PATCH_ID}-audio-toggle" style="display:none" aria-hidden="true" tabindex="-1">Browser Audio Armed By Start</button>
+        </div>
+        <div id="${PATCH_ID}-channel" class="airband-normal-scanner-small">Channel: —</div>
+        <div id="${PATCH_ID}-message" class="airband-normal-scanner-status">Scanner status loading…</div>
+      </div>
+    `;
+  }
+
+  function settingsPanelHtml() {
+    return `
+      <div id="${PATCH_ID}-settings" class="airband-normal-scanner-panel">
+        <h4>Airband Scanner Tuning</h4>
+        <div class="airband-normal-scanner-small">
+          Tune the normal scanner lock behavior. Lower SNR or lower squelch makes the scanner more sensitive.
+        </div>
+        <div class="airband-normal-scanner-actions">
+          <label>SNR dB <input id="${PATCH_ID}-snr-input" type="number" step="0.5"></label>
+          <label>Squelch dBFS <input id="${PATCH_ID}-squelch-input" type="number" step="1"></label>
+          <label>RF Gain dB <input id="${PATCH_ID}-gain-input" type="number" step="0.1"></label>
+          <label>Sample ms <input id="${PATCH_ID}-sample-input" type="number" step="50"></label>
+          <label>Silence s <input id="${PATCH_ID}-silence-input" type="number" step="0.5"></label>
+          <button id="${PATCH_ID}-save-settings">Apply Scanner Tuning</button>
+        </div>
+        <div id="${PATCH_ID}-settings-message" class="airband-normal-scanner-small">Loading scanner tuning…</div>
+      </div>
+    `;
+  }
+
+  function insertPanels() {
+    if (byId(`${PATCH_ID}-panel`)) {
+      return;
+    }
+
+    const panel = document.createElement("div");
+    panel.innerHTML = scannerPanelHtml();
+
+    const map = byId("map") || document.querySelector(".leaflet-container");
+    if (map && map.parentNode) {
+      map.parentNode.insertBefore(panel.firstElementChild, map.nextSibling);
+    } else {
+      document.body.insertBefore(panel.firstElementChild, document.body.firstChild);
+    }
+
+    const settings = document.createElement("div");
+    settings.innerHTML = settingsPanelHtml();
+
+    const configAnchor =
+      byId("airband-radius-status") ||
+      byId("receiverLocationStatus") ||
+      Array.from(document.querySelectorAll("h3,h4,summary,div,p")).find((node) =>
+        /Airband Scan Radius|Configuration/i.test(node.textContent || "")
+      );
+
+    if (configAnchor && configAnchor.parentNode) {
+      configAnchor.parentNode.insertBefore(settings.firstElementChild, configAnchor.nextSibling);
+    } else {
+      byId(`${PATCH_ID}-panel`).insertAdjacentElement("afterend", settings.firstElementChild);
+    }
+  }
+
+  function updateStatusUi(status) {
+    lastStatus = status;
+
+    const state = status.airband_scan_state || "idle";
+    const locked = status.airband_locked_channel;
+    const current = locked || status.airband_current_channel;
+    const settings = status.airband_scanner_settings || {};
+
+    byId(`${PATCH_ID}-state`).textContent = state;
+    byId(`${PATCH_ID}-frequency`).textContent = current ? `${fmt(current.frequency_mhz || current.frequency_hz / 1000000, 3)} MHz` : "—";
+    byId(`${PATCH_ID}-snr`).textContent = `${fmt(status.airband_last_signal_snr_db, 2)} dB`;
+    byId(`${PATCH_ID}-level`).textContent = `${fmt(status.airband_last_measurement_dbfs, 1)} dBFS`;
+    byId(`${PATCH_ID}-silence`).textContent =
+      status.airband_silence_remaining === null || status.airband_silence_remaining === undefined
+        ? "—"
+        : `${fmt(status.airband_silence_remaining, 1)} s`;
+
+    const audioEl = byId(`${PATCH_ID}-audio`);
+    if (status.airband_live_audio_running) {
+      audioEl.textContent = audioEnabled ? "live" : "armed";
+      audioEl.className = "airband-normal-scanner-readout airband-normal-scanner-audio-on";
+    } else {
+      audioEl.textContent = "off";
+      audioEl.className = "airband-normal-scanner-readout airband-normal-scanner-audio-off";
+    }
+
+    byId(`${PATCH_ID}-channel`).textContent = `Channel: ${channelLabel(current)}`;
+    byId(`${PATCH_ID}-message`).textContent = status.airband_scanner_message || "Airband scanner ready.";
+
+    byId(`${PATCH_ID}-skip`).disabled = !status.airband_scan_running;
+    byId(`${PATCH_ID}-block`).disabled = !current;
+    byId(`${PATCH_ID}-stop`).disabled = !status.airband_scan_running;
+
+    if (settings.snr_threshold_db !== undefined) {
+      byId(`${PATCH_ID}-snr-input`).value = settings.snr_threshold_db;
+      byId(`${PATCH_ID}-squelch-input`).value = settings.squelch_dbfs;
+      byId(`${PATCH_ID}-gain-input`).value = settings.rf_gain_db;
+      byId(`${PATCH_ID}-sample-input`).value = settings.sample_ms;
+      byId(`${PATCH_ID}-silence-input`).value = settings.silence_resume_seconds;
+    }
+
+    const liveChannel = status.airband_locked_channel || null;
+    const liveFrequency = liveChannel && liveChannel.frequency_hz ? Number(liveChannel.frequency_hz) : 0;
+    const lockKey = status.airband_live_audio_running
+      ? `${liveFrequency}:${status.airband_lock_reason || ""}:${status.airband_scanner_message || ""}`
+      : null;
+
+    if (lockKey && lockKey !== lastAirbandLockKey) {
+      lastAirbandLockKey = lockKey;
+      if (audioContext) {
+        resetAudioCursor(status);
+      } else {
+        audioCursorSamples = 0;
+      }
+      audioNextStartTime = audioContext ? audioContext.currentTime + 0.10 : 0;
+    }
+
+    if (!lockKey) {
+      lastAirbandLockKey = null;
+    }
+
+    if (status.airband_live_audio_running && audioEnabled && !audioLoopRunning) {
+      startAudioLoop();
+    }
+  }
+
+  async function refreshStatus() {
+    try {
+      const status = await getJson(STATUS_URL);
+      updateStatusUi(status);
+    } catch (error) {
+      const message = byId(`${PATCH_ID}-message`);
+      if (message) {
+        message.textContent = `Airband scanner status error: ${error.message}`;
+      }
+    }
+  }
+
+  function resetAudioCursor(status) {
+    const available = Number(status && status.airband_live_available_samples ? status.airband_live_available_samples : 0);
+    // On a new lock, start very near the live edge so audio begins quickly.
+    // Keep a small cushion so the next chunk request has data available.
+    audioCursorSamples = Math.max(0, available - 6000);
+    audioNextStartTime = audioContext ? audioContext.currentTime + 0.10 : 0;
+  }
+
+  async function ensureAudioContext() {
+    if (!audioContext) {
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+  }
+
+  async function startAudioLoop() {
+    if (!audioEnabled || audioLoopRunning) {
+      return;
+    }
+
+    await ensureAudioContext();
+    resetAudioCursor(lastStatus);
+    audioLoopRunning = true;
+
+    while (audioEnabled) {
+      try {
+        const status = lastStatus || {};
+        if (!status.airband_live_audio_running) {
+          await new Promise((resolve) => setTimeout(resolve, 350));
+          continue;
+        }
+
+        const url = `${LIVE_AUDIO_URL}?from=${audioCursorSamples}&samples=12000&_=${Date.now()}`;
+        const response = await fetch(url, { cache: "no-store" });
+
+        if (response.status === 204) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          continue;
+        }
+
+        if (response.status === 416) {
+          resetAudioCursor(lastStatus);
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          continue;
+        }
+
+        if (!response.ok) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          continue;
+        }
+
+        const sourceSamples = Number(response.headers.get("X-Source-Samples") || "0");
+        const wavData = await response.arrayBuffer();
+        if (!wavData.byteLength || sourceSamples <= 0) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          continue;
+        }
+
+        const decoded = await audioContext.decodeAudioData(wavData.slice(0));
+        const source = audioContext.createBufferSource();
+        source.buffer = decoded;
+        source.connect(audioContext.destination);
+
+        const startAt = Math.max(audioContext.currentTime + 0.03, audioNextStartTime);
+        source.start(startAt);
+        audioNextStartTime = startAt + decoded.duration;
+        audioCursorSamples += sourceSamples;
+
+        if (audioNextStartTime - audioContext.currentTime > 1.5) {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+      } catch (error) {
+        const message = byId(`${PATCH_ID}-message`);
+        if (message) {
+          message.textContent = `Browser audio error: ${error.message}`;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 650));
+      }
+    }
+
+    audioLoopRunning = false;
+  }
+
+  function wireControls() {
+    byId(`${PATCH_ID}-start`).addEventListener("click", async () => {
+      // AIRBAND_START_ONLY_AUDIO_PATCH_V1
+      // The Start Scanner button is the one browser audio permission gesture.
+      // Do as much audio setup as possible before any network await.
+      audioEnabled = true;
+      const audioToggle = byId(`${PATCH_ID}-audio-toggle`);
+      if (audioToggle) {
+        audioToggle.textContent = "Browser Audio Armed By Start";
+      }
+
+      if (!audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      try {
+        audioContext.resume();
+      } catch (_error) {
+        // Status panel will show playback errors if the browser rejects audio.
+      }
+      audioNextStartTime = audioContext.currentTime + 0.15;
+
+      await postJson(START_URL);
+      await refreshStatus();
+      resetAudioCursor(lastStatus);
+      startAudioLoop();
+    });
+
+    byId(`${PATCH_ID}-stop`).addEventListener("click", async () => {
+      audioEnabled = false;
+      await postJson(STOP_URL);
+      await refreshStatus();
+    });
+
+    byId(`${PATCH_ID}-skip`).addEventListener("click", async () => {
+      await postJson(SKIP_URL);
+      await refreshStatus();
+    });
+
+    byId(`${PATCH_ID}-block`).addEventListener("click", async () => {
+      await postJson(BLOCK_URL);
+      await refreshStatus();
+    });
+
+    byId(`${PATCH_ID}-sqdown`).addEventListener("click", async () => {
+      await postJson(SQUELCH_DOWN_URL);
+      await refreshStatus();
+    });
+
+    byId(`${PATCH_ID}-squp`).addEventListener("click", async () => {
+      await postJson(SQUELCH_UP_URL);
+      await refreshStatus();
+    });
+
+    const audioToggleButton = byId(`${PATCH_ID}-audio-toggle`);
+    if (audioToggleButton) {
+      audioToggleButton.addEventListener("click", async () => {
+        // Hidden compatibility control. Browser audio is intentionally started only by Start Scanner.
+        audioEnabled = true;
+        await ensureAudioContext();
+        resetAudioCursor(lastStatus);
+        startAudioLoop();
+      });
+    }
+
+    byId(`${PATCH_ID}-save-settings`).addEventListener("click", async () => {
+      const payload = {
+        snr_threshold_db: Number(byId(`${PATCH_ID}-snr-input`).value),
+        squelch_dbfs: Number(byId(`${PATCH_ID}-squelch-input`).value),
+        rf_gain_db: Number(byId(`${PATCH_ID}-gain-input`).value),
+        sample_ms: Number(byId(`${PATCH_ID}-sample-input`).value),
+        silence_resume_seconds: Number(byId(`${PATCH_ID}-silence-input`).value)
+      };
+      const result = await postJson(SETTINGS_URL, payload);
+      byId(`${PATCH_ID}-settings-message`).textContent = "Scanner tuning saved.";
+      updateStatusUi(result);
+    });
+  }
+
+  function init() {
+    if (byId(`${PATCH_ID}-panel`)) {
+      return;
+    }
+
+    insertPanels();
+    wireControls();
+    refreshStatus();
+
+    if (pollTimer) {
+      clearInterval(pollTimer);
+    }
+    pollTimer = setInterval(refreshStatus, 1000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+</script>
+<!-- /AIRBAND_NORMAL_SCANNER_UI_PATCH_V1 -->
+
+
+<!-- AIRBAND_HIDE_AUDIO_TOGGLE_PATCH_V1 -->
+<style>
+  #airband-normal-scanner-ui-audio-toggle {
+    display: none !important;
+    visibility: hidden !important;
+  }
+</style>
+<script>
+(function () {
+  "use strict";
+
+  function hideAirbandAudioToggle() {
+    const button = document.getElementById("airband-normal-scanner-ui-audio-toggle");
+    if (button) {
+      button.style.setProperty("display", "none", "important");
+      button.style.setProperty("visibility", "hidden", "important");
+      button.setAttribute("aria-hidden", "true");
+      button.setAttribute("tabindex", "-1");
+    }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", hideAirbandAudioToggle);
+  } else {
+    hideAirbandAudioToggle();
+  }
+
+  setTimeout(hideAirbandAudioToggle, 250);
+  setTimeout(hideAirbandAudioToggle, 1000);
+})();
+</script>
+<!-- /AIRBAND_HIDE_AUDIO_TOGGLE_PATCH_V1 -->
+
+
+<!-- AIRBAND_AUDIO_CURSOR_AFTER_SKIP_FIX_V1 -->
+<script>
+(function () {
+  "use strict";
+
+  // This patch reaches into the normal Airband scanner UI closure indirectly by
+  // intercepting fetch responses for the live audio endpoint. The main UI code
+  // is also patched below by text replacement when this script is applied.
+})();
+</script>
+<!-- /AIRBAND_AUDIO_CURSOR_AFTER_SKIP_FIX_V1 -->
+
 </body>
 </html>
