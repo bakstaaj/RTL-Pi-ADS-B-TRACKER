@@ -368,6 +368,21 @@ body { padding: 0; }
 .provider-test-row label { flex: 1; min-width: 160px; }
 
 </style>
+
+<!-- AIRBAND_RESTORE_SQUELCH_READOUT_PATCH_V1 -->
+<style>
+  #airband-normal-scanner-ui-squelch-value {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    min-height: 28px !important;
+    padding: 0 8px !important;
+    vertical-align: middle !important;
+    line-height: 1 !important;
+    white-space: nowrap !important;
+    font-variant-numeric: tabular-nums;
+  }
+</style>
 </head>
 <body>
 <header class="app-header">
@@ -2400,6 +2415,7 @@ document.addEventListener('DOMContentLoaded', () => {
           <button id="${PATCH_ID}-skip">Skip Open Frequency</button>
           <button id="${PATCH_ID}-block">Block Frequency</button>
           <button id="${PATCH_ID}-sqdown">Squelch −</button>
+          <span id="${PATCH_ID}-squelch-value" class="airband-normal-scanner-readout" data-patch="AIRBAND_RESTORE_SQUELCH_READOUT_PATCH_V1-span">— dBFS</span>
           <button id="${PATCH_ID}-squp">Squelch +</button>
           <button id="${PATCH_ID}-audio-toggle" style="display:none" aria-hidden="true" tabindex="-1">Browser Audio Armed By Start</button>
         </div>
@@ -2523,6 +2539,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (settings.snr_threshold_db !== undefined) {
       byId(`${PATCH_ID}-snr-input`).value = settings.snr_threshold_db;
       byId(`${PATCH_ID}-squelch-input`).value = settings.squelch_dbfs;
+      const squelchReadout = byId(`${PATCH_ID}-squelch-value`);
+      if (squelchReadout) {
+        squelchReadout.textContent = `${fmt(settings.squelch_dbfs, 1)} dBFS`;
+      }
       byId(`${PATCH_ID}-gain-input`).value = settings.rf_gain_db;
       byId(`${PATCH_ID}-sample-input`).value = settings.sample_ms;
       byId(`${PATCH_ID}-silence-input`).value = settings.silence_resume_seconds;
