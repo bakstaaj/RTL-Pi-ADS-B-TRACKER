@@ -2323,6 +2323,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const SETTINGS_URL = "/api/airband/scan/settings";
   const START_URL = "/api/airband/scan/activity/start?scope=all";
   const STOP_URL = "/api/airband/scan/activity/stop";
+  const NOAA_LIVE_STOP_URL = "/api/noaa/live/stop";
   const SKIP_URL = "/api/airband/scan/activity/skip";
   const BLOCK_URL = "/api/airband/scan/activity/block";
   const SQUELCH_UP_URL = "/api/airband/scan/squelch/up";
@@ -2672,6 +2673,16 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       audioNextStartTime = audioContext.currentTime + 0.15;
 
+      // AIRBAND_START_STOPS_WX_FIRST_PATCH_V1
+      // WX/NOAA and Airband share the same audio RTL-SDR. Stop NOAA live first
+      // so Start Scanner can switch directly from WX to Airband without a 409.
+      try {
+        await postJson(NOAA_LIVE_STOP_URL);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      } catch (_error) {
+        // NOAA/WX may already be stopped; continue with Airband start.
+      }
+
       await postJson(START_URL);
       await refreshStatus();
       resetAudioCursor(lastStatus);
@@ -2682,6 +2693,7 @@ document.addEventListener('DOMContentLoaded', () => {
       audioEnabled = false;
       await postJson(STOP_URL);
       await refreshStatus();
+      setTimeout(() => window.dispatchEvent(new Event("airband-started")), 50);
     });
 
     byId(`${PATCH_ID}-skip`).addEventListener("click", async () => {
@@ -2800,6 +2812,496 @@ document.addEventListener('DOMContentLoaded', () => {
 })();
 </script>
 <!-- /AIRBAND_AUDIO_CURSOR_AFTER_SKIP_FIX_V1 -->
+
+
+<!-- AIRBAND_WX_DUPLICATE_OPERATIONS_BUTTON_PATCH_V1 -->
+<style>
+  #airband-normal-scanner-ui-wx {
+    padding: 4px 8px;
+    border-radius: 6px;
+    border: 1px solid rgba(210, 210, 210, 0.55);
+    background: rgba(255, 255, 255, 0.10);
+    color: inherit;
+    cursor: pointer;
+  }
+
+  #airband-normal-scanner-ui-wx:hover {
+    background: rgba(255, 255, 255, 0.20);
+  }
+</style>
+<script>
+(function () {
+  "use strict";
+
+  const PATCH_ID = "airband-normal-scanner-ui";
+  const WX_BUTTON_ID = `${PATCH_ID}-wx`;
+  let lastKnownWxRunning = false;
+  let wxToggleInFlight = false;
+  let wxSuppressUntil = 0;
+  // AIRBAND_INITIAL_WX_DOUBLE_TOGGLE_DEBOUNCE_PATCH_V1
+
+  function byId(id) {
+    return document.getElementById(id);
+  }
+
+  function setAirbandMessage(text) {
+    const message = byId(`${PATCH_ID}-message`);
+    if (message) {
+      message.textContent = text;
+    }
+  }
+
+  function allButtons() {
+    return Array.from(document.querySelectorAll("button"));
+  }
+
+  function normalizeText(node) {
+    return (node && node.textContent ? node.textContent : "").replace(/\s+/g, " ").trim();
+  }
+
+  function isThisPatchButton(button) {
+    return button && button.id === WX_BUTTON_ID;
+  }
+
+  function isNoaaWxButton(button) {
+    if (!button || isThisPatchButton(button)) {
+      return false;
+    }
+    const text = normalizeText(button).toLowerCase();
+    const id = String(button.id || "").toLowerCase();
+    const title = String(button.title || "").toLowerCase();
+    const aria = String(button.getAttribute("aria-label") || "").toLowerCase();
+    const combined = `${text} ${id} ${title} ${aria}`;
+
+    return (
+      combined.includes("noaa") ||
+      combined.includes("weather") ||
+      /\bwx\b/.test(combined)
+    );
+  }
+
+  function findOperationsWxToggle(wantStop) {
+    const candidates = allButtons().filter(isNoaaWxButton);
+
+    // Prefer an explicit start/stop button matching desired state.
+    const explicit = candidates.find((button) => {
+      const text = normalizeText(button).toLowerCase();
+      const id = String(button.id || "").toLowerCase();
+      const title = String(button.title || "").toLowerCase();
+      const aria = String(button.getAttribute("aria-label") || "").toLowerCase();
+      const combined = `${text} ${id} ${title} ${aria}`;
+
+      if (wantStop) {
+        return combined.includes("stop") || combined.includes("off");
+      }
+      return combined.includes("start") || combined.includes("listen") || combined.includes("on");
+    });
+
+    if (explicit) {
+      return explicit;
+    }
+
+    // Fallback to any NOAA/WX-looking button that is not our convenience button.
+    return candidates[0] || null;
+  }
+
+  const AIRBAND_STOP_URL_FOR_WX = "/api/airband/scan/activity/stop";
+
+  function delayForWxSwitch(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function postJson(url) {
+    const response = await fetch(url, { method: "POST", cache: "no-store" });
+    const text = await response.text();
+    let payload = {};
+    if (text) {
+      try {
+        payload = JSON.parse(text);
+      } catch (_error) {
+        payload = { raw: text };
+      }
+    }
+    if (!response.ok) {
+      throw new Error(payload.error || `${url} failed with HTTP ${response.status}`);
+    }
+    return payload;
+  }
+
+  async function getStatus() {
+    const response = await fetch("/api/status", { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`/api/status failed with HTTP ${response.status}`);
+    }
+    return response.json();
+  }
+
+  function updateWxButtonFromStatus(status) {
+    const button = byId(WX_BUTTON_ID);
+    if (!button || !status) {
+      return;
+    }
+
+    lastKnownWxRunning = status.audio_mode === "noaa_live" || !!status.live_audio_running;
+    button.textContent = lastKnownWxRunning ? "WX Off" : "WX";
+    button.title = lastKnownWxRunning ? "Stop NOAA Weather audio" : "Start NOAA Weather audio";
+  }
+
+  async function refreshWxState() {
+    try {
+      const status = await getStatus();
+      updateWxButtonFromStatus(status);
+    } catch (_error) {
+      // Existing page status polling continues independently.
+    }
+  }
+
+  function insertWxButton() {
+    const startButton = byId(`${PATCH_ID}-start`);
+    if (!startButton || byId(WX_BUTTON_ID)) {
+      return;
+    }
+
+    const wxButton = document.createElement("button");
+    wxButton.id = WX_BUTTON_ID;
+    wxButton.type = "button";
+    wxButton.textContent = "WX";
+    wxButton.title = "Start NOAA Weather audio";
+
+    startButton.parentNode.insertBefore(wxButton, startButton);
+  }
+
+  function clickOperationsWxButtonLater(button) {
+    window.setTimeout(() => {
+      try {
+        button.click();
+      } finally {
+        window.setTimeout(() => {
+          wxToggleInFlight = false;
+        }, 1200);
+      }
+    }, 100);
+  }
+
+  async function handleWxClick(event) {
+    const button = event.target && event.target.closest ? event.target.closest("button") : null;
+    if (!button || button.id !== WX_BUTTON_ID) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+
+    const now = Date.now();
+    if (wxToggleInFlight || now < wxSuppressUntil) {
+      return;
+    }
+
+    wxToggleInFlight = true;
+    wxSuppressUntil = now + 2500;
+
+    try {
+      const status = await getStatus();
+      updateWxButtonFromStatus(status);
+    } catch (_error) {
+      // Use last known state.
+    }
+
+    const wantStop = lastKnownWxRunning;
+    const operationsButton = findOperationsWxToggle(wantStop);
+
+    if (operationsButton) {
+      setAirbandMessage(wantStop ? "Stopping WX audio…" : "Starting WX audio…");
+
+      // AIRBAND_WX_STOPS_AIRBAND_FIRST_PATCH_V1
+      // WX and Airband share the same audio RTL-SDR. If WX is currently off,
+      // this click is a WX start request, so stop Airband first and give the
+      // backend a moment to release the receiver before delegating to the
+      // existing Operations NOAA/WX control.
+      if (!wantStop) {
+        try {
+          await postJson(AIRBAND_STOP_URL_FOR_WX);
+          await delayForWxSwitch(700);
+        } catch (_error) {
+          // Airband may already be stopped; continue with WX start.
+        }
+      }
+
+      clickOperationsWxButtonLater(operationsButton);
+      setTimeout(refreshWxState, 700);
+      setTimeout(refreshWxState, 1500);
+      return;
+    }
+
+    // Fallback only. The preferred path above uses the validated Operations menu
+    // control so browser audio behavior remains identical to the existing UI.
+    try {
+      setAirbandMessage(wantStop ? "Stopping WX audio…" : "Starting WX audio…");
+      if (!wantStop) {
+        try {
+          await postJson(AIRBAND_STOP_URL_FOR_WX);
+          await delayForWxSwitch(700);
+        } catch (_error) {
+          // Airband may already be stopped.
+        }
+      }
+      await postJson(wantStop ? "/api/noaa/live/stop" : "/api/noaa/live/start");
+      await refreshWxState();
+    } catch (error) {
+      setAirbandMessage(`WX toggle failed: ${error.message}`);
+    } finally {
+      window.setTimeout(() => {
+        wxToggleInFlight = false;
+      }, 1200);
+    }
+  }
+
+  function initWxDuplicateButton() {
+    insertWxButton();
+    refreshWxState();
+
+    // The Airband panel is dynamically inserted by another patch, so try again
+    // shortly after load in case this patch runs first.
+    setTimeout(insertWxButton, 500);
+    setTimeout(refreshWxState, 750);
+    setTimeout(insertWxButton, 1500);
+    setTimeout(refreshWxState, 1750);
+  }
+
+  document.addEventListener("click", handleWxClick, true);
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initWxDuplicateButton);
+  } else {
+    initWxDuplicateButton();
+  }
+
+  setInterval(refreshWxState, 2500);
+})();
+</script>
+<!-- /AIRBAND_WX_DUPLICATE_OPERATIONS_BUTTON_PATCH_V1 -->
+
+
+<!-- AIRBAND_WX_WAITS_FOR_AIRBAND_IDLE_PATCH_V1 -->
+<script>
+(function () {
+  "use strict";
+
+  if (window.__airbandWxWaitsForIdleInstalled) {
+    return;
+  }
+  window.__airbandWxWaitsForIdleInstalled = true;
+
+  const PATCH_ID = "airband-normal-scanner-ui";
+  const WX_BUTTON_ID = `${PATCH_ID}-wx`;
+  const AIRBAND_STOP_URL = "/api/airband/scan/activity/stop";
+  const NOAA_START_URL = "/api/noaa/live/start";
+  const NOAA_STOP_URL = "/api/noaa/live/stop";
+
+  function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function byId(id) {
+    return document.getElementById(id);
+  }
+
+  function setAirbandMessage(text) {
+    const message = byId(`${PATCH_ID}-message`);
+    if (message) {
+      message.textContent = text;
+    }
+  }
+
+  async function postJson(url) {
+    const response = await fetch(url, { method: "POST", cache: "no-store" });
+    const text = await response.text();
+    let payload = {};
+    if (text) {
+      try {
+        payload = JSON.parse(text);
+      } catch (_error) {
+        payload = { raw: text };
+      }
+    }
+    if (!response.ok) {
+      throw new Error(payload.error || `${url} failed with HTTP ${response.status}`);
+    }
+    return payload;
+  }
+
+  async function getStatus() {
+    const response = await fetch("/api/status", { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`/api/status failed with HTTP ${response.status}`);
+    }
+    return response.json();
+  }
+
+  function normalizedText(node) {
+    return (node && node.textContent ? node.textContent : "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  function isOurWxButton(button) {
+    return button && button.id === WX_BUTTON_ID;
+  }
+
+  function isOperationsNoaaWxButton(button) {
+    if (!button || isOurWxButton(button)) {
+      return false;
+    }
+
+    const combined = [
+      normalizedText(button),
+      String(button.id || "").toLowerCase(),
+      String(button.title || "").toLowerCase(),
+      String(button.getAttribute("aria-label") || "").toLowerCase()
+    ].join(" ");
+
+    return (
+      combined.includes("noaa") ||
+      combined.includes("weather") ||
+      /\bwx\b/.test(combined)
+    );
+  }
+
+  function findOperationsWxButton(wantStop) {
+    const candidates = Array.from(document.querySelectorAll("button"))
+      .filter(isOperationsNoaaWxButton);
+
+    const enabled = candidates.filter((button) => !button.disabled);
+    const searchList = enabled.length ? enabled : candidates;
+
+    const explicit = searchList.find((button) => {
+      const combined = [
+        normalizedText(button),
+        String(button.id || "").toLowerCase(),
+        String(button.title || "").toLowerCase(),
+        String(button.getAttribute("aria-label") || "").toLowerCase()
+      ].join(" ");
+
+      if (wantStop) {
+        return combined.includes("stop") || combined.includes("off");
+      }
+      return combined.includes("start") || combined.includes("listen") || combined.includes("on");
+    });
+
+    return explicit || searchList[0] || null;
+  }
+
+  async function waitForAirbandIdle(maxMs) {
+    const deadline = Date.now() + maxMs;
+
+    while (Date.now() < deadline) {
+      let status = null;
+      try {
+        status = await getStatus();
+      } catch (_error) {
+        await delay(250);
+        continue;
+      }
+
+      const airbandStopped = !status.airband_scan_running &&
+        status.airband_scan_state !== "locked" &&
+        status.airband_scan_state !== "spectrum_search" &&
+        status.audio_mode !== "airband_scan" &&
+        status.audio_mode !== "airband_live";
+
+      if (airbandStopped) {
+        return status;
+      }
+
+      await delay(250);
+    }
+
+    return await getStatus().catch(() => null);
+  }
+
+  function updateLocalWxButton(status) {
+    const button = byId(WX_BUTTON_ID);
+    if (!button || !status) {
+      return;
+    }
+    const wxRunning = status.audio_mode === "noaa_live" || !!status.live_audio_running;
+    button.textContent = wxRunning ? "WX Off" : "WX";
+    button.title = wxRunning ? "Stop NOAA Weather audio" : "Start NOAA Weather audio";
+  }
+
+  async function handleUnderMapWx(event) {
+    const button = event.target && event.target.closest ? event.target.closest("button") : null;
+    if (!button || button.id !== WX_BUTTON_ID) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+
+    let status = null;
+    try {
+      status = await getStatus();
+      updateLocalWxButton(status);
+    } catch (_error) {
+      status = null;
+    }
+
+    const wxRunning = !!status && (status.audio_mode === "noaa_live" || !!status.live_audio_running);
+
+    if (wxRunning) {
+      setAirbandMessage("Stopping WX audio…");
+      const operationsButton = findOperationsWxButton(true);
+      if (operationsButton) {
+        operationsButton.click();
+      } else {
+        try {
+          await postJson(NOAA_STOP_URL);
+        } catch (error) {
+          setAirbandMessage(`WX stop failed: ${error.message}`);
+          return;
+        }
+      }
+      setTimeout(async () => updateLocalWxButton(await getStatus().catch(() => null)), 700);
+      return;
+    }
+
+    setAirbandMessage("Stopping Airband before WX…");
+
+    try {
+      await postJson(AIRBAND_STOP_URL);
+    } catch (_error) {
+      // Airband may already be stopped.
+    }
+
+    const idleStatus = await waitForAirbandIdle(5000);
+    updateLocalWxButton(idleStatus);
+
+    setAirbandMessage("Starting WX audio…");
+
+    // Re-find after Airband has actually stopped; the Operations control may
+    // have been disabled or stale before the status refresh.
+    const operationsButton = findOperationsWxButton(false);
+    if (operationsButton) {
+      operationsButton.click();
+      setTimeout(async () => updateLocalWxButton(await getStatus().catch(() => null)), 700);
+      setTimeout(async () => updateLocalWxButton(await getStatus().catch(() => null)), 1800);
+      return;
+    }
+
+    // Fallback if the Operations control cannot be found.
+    try {
+      await postJson(NOAA_START_URL);
+      updateLocalWxButton(await getStatus().catch(() => null));
+      setAirbandMessage("WX audio started.");
+    } catch (error) {
+      setAirbandMessage(`WX start failed: ${error.message}`);
+    }
+  }
+
+  document.addEventListener("click", handleUnderMapWx, true);
+})();
+</script>
+<!-- /AIRBAND_WX_WAITS_FOR_AIRBAND_IDLE_PATCH_V1 -->
 
 </body>
 </html>
