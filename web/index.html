@@ -1417,16 +1417,54 @@ async function updateAircraft() {
   }
 }
 
+function isAirlabsConfiguredStatus(status) {
+  return !!(status && (status.configured || status.enabled));
+}
+
+function airlabsKeyHint(status) {
+  if (!status) return 'configured';
+  return status.key_hint || status.masked_key || 'configured';
+}
+
+function airlabsCacheCount(status) {
+  if (!status) return 0;
+  return status.route_cache_entries || status.cache_count || 0;
+}
+
+function normalizeAirlabsRoutePayload(payload, status) {
+  const route = payload && payload.route ? payload.route : payload;
+  const configured = isAirlabsConfiguredStatus(status);
+  if (!configured) {
+    return {configured: false, matched: false, message: 'AirLabs not configured'};
+  }
+  if (!route) {
+    return {configured: true, matched: false, message: 'AirLabs route lookup returned no payload.'};
+  }
+  const matched = !!(route.found || route.matched);
+  return {
+    configured: true,
+    matched,
+    cache_hit: !!(payload && payload.cached) || !!route.cached || !!route.cache_hit,
+    message: route.message || (matched ? '' : 'No AirLabs route match'),
+    departure_iata: route.departure_iata || route.dep_iata || route.from || '',
+    departure_icao: route.departure_icao || route.dep_icao || '',
+    arrival_iata: route.arrival_iata || route.arr_iata || route.to || '',
+    arrival_icao: route.arrival_icao || route.arr_icao || '',
+    flight_iata: route.flight_iata || '',
+    flight_icao: route.flight_icao || (payload && payload.flight_icao) || ''
+  };
+}
+
 async function loadAirlabsSettings() {
   try {
     const status = await jsonRequest('/api/diagnostics/airlabs/status');
     el('airlabsApiKey').value = '';
     setMessage(
       'airlabsMessage',
-      status.configured
-        ? `AirLabs route lookup configured (${status.key_hint}). Cached successful routes: ${status.route_cache_entries || 0}; expires after ${Math.round((status.cache_ttl_seconds || 7200) / 3600)} hours.`
+      isAirlabsConfiguredStatus(status)
+        ? `AirLabs route lookup configured (${airlabsKeyHint(status)}). Cached successful routes: ${airlabsCacheCount(status)}; expires after ${Math.round((status.cache_ttl_seconds || 7200) / 3600)} hours.`
         : 'AirLabs is not configured. Paste an API key and save it here.',
-      status.configured ? 'good' : 'warning'
+      isAirlabsConfiguredStatus(status) ? 'good' : 'warning'
     );
   } catch (error) {
     setMessage('airlabsMessage', `Unable to load AirLabs status: ${error.message}`, 'error');
@@ -1444,9 +1482,10 @@ async function saveAirlabsKey() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({api_key: apiKey})
     });
-    if (!result.configured) throw new Error('Pi could not read back the saved AirLabs key.');
+    const savedStatus = result.status || result;
+    if (!isAirlabsConfiguredStatus(savedStatus)) throw new Error('Pi could not read back the saved AirLabs key.');
     el('airlabsApiKey').value = '';
-    setMessage('airlabsMessage', `AirLabs key saved on the Pi (${result.key_hint}).`, 'good');
+    setMessage('airlabsMessage', `AirLabs key saved on the Pi (${airlabsKeyHint(savedStatus)}).`, 'good');
   } catch (error) {
     setMessage('airlabsMessage', `AirLabs key save failed: ${error.message}`, 'error');
   }
@@ -1456,7 +1495,7 @@ async function clearAirlabsKey() {
     await jsonRequest('/api/diagnostics/airlabs/settings', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({clear: true})
+      body: JSON.stringify({action: 'clear'})
     });
     el('airlabsApiKey').value = '';
     setMessage('airlabsMessage', 'AirLabs key removed from the Pi.', 'good');
@@ -1469,7 +1508,12 @@ function formatAirlabsAirport(iata, icao) {
   return iata || icao || 'Unavailable';
 }
 async function requestAirlabsDiagnosticRoute(flight) {
-  return await jsonRequest(`/api/diagnostics/airlabs/route?flight=${encodeURIComponent(flight || '')}`);
+  const status = await jsonRequest('/api/diagnostics/airlabs/status');
+  if (!isAirlabsConfiguredStatus(status)) {
+    return normalizeAirlabsRoutePayload(null, status);
+  }
+  const payload = await jsonRequest(`/api/diagnostics/airlabs/route?flight_icao=${encodeURIComponent(flight || '')}`);
+  return normalizeAirlabsRoutePayload(payload, status);
 }
 async function clearAirlabsRouteCache() {
   try {
@@ -3323,5 +3367,13 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 <!-- /AIRBAND_WX_WAITS_FOR_AIRBAND_IDLE_PATCH_V1 -->
 
+
+<!-- AIRLABS_ROUTE_RESPONSE_SHAPE_FIX_PATCH_V1: removed duplicate appended AirLabs UI; native AirLabs UI remains. -->
+
+
+<!-- AIRLABS_REMOVE_STATUS_BRIDGE_PATCH_V1: removed AIRLABS_UI_STATUS_BRIDGE_PATCH_V1 because it could hang page load. -->
+
+
+<!-- AIRLABS_ROUTE_RESPONSE_SHAPE_FIX_PATCH_V1 -->
 </body>
 </html>
