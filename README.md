@@ -510,3 +510,197 @@ ssh "${PI_USER}@${PI_HOST}"   "systemctl status rtl-pi-api.service --no-pager"
 - Runtime settings and caches should not be committed to Git.
 - Photo fallback images are best-effort. Exact registration images are preferred; representative type images are labeled as representative.
 - AirLabs route data depends on AirLabs API availability, plan limits, and whether a current flight match exists.
+
+<!-- RTL_PI_ADSB_V3_2_0_FEATURE_DOCS_START -->
+
+## v3.2.0 Enhancements: Trail Cleanup and Improved Aircraft Photo Fallback
+
+Version **v3.2.0** improves map trail behavior and aircraft photo fallback reliability.
+
+### Active trail cleanup when aircraft leave range
+
+The map now clears the currently visible active trail for an aircraft when that aircraft drops out of the live receiver feed or leaves range.
+
+Behavior:
+
+```text
+Live aircraft visible:
+- aircraft marker is shown
+- active trail is shown
+
+Aircraft leaves live range:
+- aircraft marker is removed
+- active visible trail is removed from the map
+- retained trail history remains available for Restore History
+```
+
+This keeps the active map cleaner while preserving historical trail data for later review.
+
+### Trail history remains available
+
+Clearing active trails from the live map does **not** erase browser/Pi trail history.
+
+Use **Restore History** to redraw retained trail history after aircraft have left the live range.
+
+### Trail hover popup
+
+Trail segments can show hover information including:
+
+```text
+Call Sign / ICAO
+Last seen date/time
+From → To route when available
+```
+
+Route information is shown when AirLabs route enrichment has a matching route.
+
+### Native aircraft photo fallback
+
+v3.2.0 moves aircraft photo fallback into the native aircraft photo render path.
+
+The UI no longer uses broad MutationObserver-based photo fallback logic. This avoids popup reloads, duplicate photo boxes, and duplicate photo credit text.
+
+Photo lookup order:
+
+1. ADSBDB aircraft photo thumbnail.
+2. ADSBDB full aircraft photo.
+3. Local backend best-guess aircraft photo fallback.
+4. Representative aircraft type photo fallback.
+
+The existing aircraft photo frame is reused, so fallback photos appear in the normal photo location.
+
+### Photo lookup spinner
+
+The photo frame now shows a spinner while all photo lookup attempts are still running.
+
+Expected behavior:
+
+```text
+Looking up aircraft photo… [spinner]
+
+Then either:
+[picture]
+
+or, only after all attempts fail:
+No photograph available for this aircraft.
+```
+
+This avoids briefly showing a no-photo message before the fallback image appears.
+
+### Representative aircraft type fallback
+
+When no exact aircraft image is available, the backend can show a representative aircraft type image.
+
+Representative fallback is clearly credited, for example:
+
+```text
+Photo: representative aircraft type image from Wikimedia.
+Photo: representative aircraft type image from Wikimedia Commons.
+```
+
+Representative images should be treated as best-effort type examples, not exact tail-number photos.
+
+### Model synonym handling
+
+v3.2.0 improves model/type query generation for common aircraft strings returned by aircraft databases.
+
+Examples handled:
+
+```text
+Airbus A320 214       -> Airbus A320 / A320-214 / A320ceo / A320 family
+Airbus A321-271NX     -> Airbus A321neo / A321 family
+Boeing 737-8          -> Boeing 737 MAX 8
+Boeing 737-9          -> Boeing 737 MAX 9
+Boeing 737NG 900ER/W  -> Boeing 737-900ER / 737NG 900ER / winglets
+Boeing 757 26D/W      -> Boeing 757-200 / 757-200 winglets
+Embraer EMB-175 LL    -> Embraer E175 / ERJ-175
+Embraer ERJ 170-200 LR -> Embraer E175 / 170-200
+Bombardier CRJ 900 LR NG -> Bombardier CRJ 900
+```
+
+The fallback also uses operator context when available, such as:
+
+```text
+Delta Connection Embraer E175
+Alaska Airlines Boeing 737-900ER
+Delta Air Lines Boeing 757-200
+American Eagle CRJ 900
+```
+
+### Image sources and filtering
+
+Fallback image sources include:
+
+```text
+JetPhotos
+Planespotters
+Wikimedia
+Wikimedia Commons
+```
+
+The backend filters out common non-aircraft images such as:
+
+```text
+logos
+social cards
+icons
+SVG logo thumbnails
+placeholder images
+default/no-photo images
+```
+
+### Photo fallback cache
+
+Successful fallback photo results are cached locally on the Pi.
+
+Default cache path:
+
+```text
+/opt/rtl-pi-adsb-tracker/settings/aircraft_photo_fallback_cache.json
+```
+
+Clear the cache during testing:
+
+```bash
+source .pi.env
+
+ssh "${PI_USER}@${PI_HOST}" \
+  "rm -f ${PI_DEPLOY_DIR}/settings/aircraft_photo_fallback_cache.json"
+```
+
+### Test photo fallback from the shell
+
+Examples:
+
+```bash
+curl -sS \
+  "http://${PI_HOST}:8080/api/aircraft/photo/fallback?manufacturer=Boeing&type=757%2026D%2FW&model=757%2026D%2FW&operator=Delta%20Air%20Lines" \
+  | python3 -m json.tool
+
+curl -sS \
+  "http://${PI_HOST}:8080/api/aircraft/photo/fallback?manufacturer=Boeing&type=737NG%20900ER%2FW&model=737NG%20900ER%2FW&operator=Alaska%20Airlines" \
+  | python3 -m json.tool
+
+curl -sS \
+  "http://${PI_HOST}:8080/api/aircraft/photo/fallback?manufacturer=Bombardier&type=CRJ%20900%20LR%20NG&model=CRJ%20900%20LR%20NG&operator=American%20Eagle" \
+  | python3 -m json.tool
+```
+
+A successful representative fallback includes:
+
+```text
+found: true
+match_level: type
+representative: true
+source: Wikimedia / Wikimedia Commons / JetPhotos / Planespotters
+```
+
+### v3.2.0 operational notes
+
+- ADSBDB photos remain the first choice.
+- Representative fallback photos are only used when exact photos are unavailable.
+- Runtime caches should not be committed to Git.
+- Patch scripts and backup files should not be committed.
+- Hard-refresh the browser after deploying web UI changes.
+
+<!-- RTL_PI_ADSB_V3_2_0_FEATURE_DOCS_END -->

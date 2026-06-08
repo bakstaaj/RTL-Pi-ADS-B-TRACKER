@@ -3563,5 +3563,1065 @@ Handler.do_GET = _aircraft_photo_do_get
 # /AIRCRAFT_PHOTO_TYPE_FALLBACK_CACHE_PATCH_V1
 # /AIRCRAFT_PHOTO_BEST_GUESS_BACKEND_PATCH_V1
 
+
+# AIRCRAFT_PHOTO_MODEL_FALLBACK_IMPROVEMENT_PATCH_V1
+# Improve representative make/model/type photo fallback.
+#
+# This override keeps exact registration/hex lookup first, then improves
+# representative model/type fallback using manufacturer terms and Wikimedia.
+
+def _aircraft_photo_expand_model_terms(manufacturer: str, aircraft_type: str, model: str) -> list[str]:
+    maker = _aircraft_photo_normalize_token(manufacturer)
+    aircraft_type = _aircraft_photo_normalize_token(aircraft_type)
+    model = _aircraft_photo_normalize_token(model)
+
+    terms: list[str] = []
+
+    def add(value: str) -> None:
+        value = _aircraft_photo_normalize_token(value)
+        if value and value not in terms:
+            terms.append(value)
+
+    add(" ".join(part for part in (maker, model or aircraft_type) if part).strip())
+    add(" ".join(part for part in (maker, aircraft_type) if part).strip())
+    add(model)
+    add(aircraft_type)
+
+    shorthand = (model or aircraft_type).upper()
+    compact = " ".join(part for part in (maker, model or aircraft_type) if part).upper()
+
+    if maker == "BOEING":
+        if shorthand in {"737-8", "B737-8", "B38M", "737 MAX 8", "737-8 MAX"} or "737-8" in compact:
+            add("Boeing 737 MAX 8")
+            add("Boeing 737-8 MAX")
+        if shorthand in {"737-9", "B737-9", "B39M", "737 MAX 9", "737-9 MAX"} or "737-9" in compact:
+            add("Boeing 737 MAX 9")
+            add("Boeing 737-9 MAX")
+        if shorthand in {"737-7", "B737-7", "B37M", "737 MAX 7", "737-7 MAX"} or "737-7" in compact:
+            add("Boeing 737 MAX 7")
+        if shorthand in {"737-10", "B737-10", "B3XM", "737 MAX 10", "737-10 MAX"} or "737-10" in compact:
+            add("Boeing 737 MAX 10")
+
+    if maker in {"EMBRAER", "EMB"} and ("175" in shorthand or "E175" in shorthand):
+        add("Embraer E175")
+        add("Embraer 175")
+
+    if maker == "AIRBUS" and shorthand.startswith("A"):
+        add("Airbus " + shorthand)
+
+    expanded: list[str] = []
+    for term in terms:
+        if not term:
+            continue
+        value = term if "AIRCRAFT" in term.upper() else term + " aircraft"
+        if value not in expanded:
+            expanded.append(value)
+
+    return expanded
+
+
+def _aircraft_photo_wikimedia_thumbnail(query: str) -> dict | None:
+    search = _aircraft_photo_urlparse.urlencode({
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrlimit": "5",
+        "prop": "pageimages|info",
+        "pithumbsize": "900",
+        "inprop": "url",
+        "origin": "*",
+    })
+    url = "https://en.wikipedia.org/w/api.php?" + search
+
+    try:
+        request = _aircraft_photo_urlrequest.Request(
+            url,
+            headers={
+                "User-Agent": "RTL-Pi-ADS-B-Tracker aircraft representative photo fallback",
+                "Accept": "application/json",
+            },
+        )
+        with _aircraft_photo_urlrequest.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+
+        pages = list((payload.get("query") or {}).get("pages", {}).values())
+        pages.sort(key=lambda page: int(page.get("index") or 9999))
+
+        for page in pages:
+            thumbnail = page.get("thumbnail") or {}
+            image_url = thumbnail.get("source")
+            if image_url:
+                return {
+                    "found": True,
+                    "source": "Wikimedia",
+                    "page_url": page.get("fullurl") or f"https://en.wikipedia.org/?curid={page.get('pageid')}",
+                    "image_url": image_url,
+                    "query": query,
+                    "cached": False,
+                    "match_level": "type",
+                    "representative": True,
+                    "type_query": query,
+                    "looked_up_utc": int(time.time()),
+                }
+    except Exception:
+        return None
+
+    return None
+
+
+def _aircraft_photo_lookup_representative_type(aircraft_type: str, model: str, manufacturer: str = "") -> dict:
+    queries = _aircraft_photo_expand_model_terms(manufacturer, aircraft_type, model)
+    if not queries:
+        return {
+            "found": False,
+            "source": "type_fallback",
+            "query": "",
+            "cached": False,
+            "match_level": "none",
+            "representative": False,
+            "looked_up_utc": int(time.time()),
+            "message": "No aircraft manufacturer/type/model available for representative photo lookup.",
+        }
+
+    for query in queries:
+        cache_key = _aircraft_photo_cache_key("type:" + query)
+        cached = _aircraft_photo_cache_get(cache_key)
+        if cached:
+            cached["match_level"] = cached.get("match_level") or "type"
+            cached["representative"] = True
+            cached["type_query"] = cached.get("type_query") or query
+            return cached
+
+        result = _aircraft_photo_lookup_live(query, query)
+        result["match_level"] = "type" if result.get("found") else "none"
+        result["representative"] = bool(result.get("found"))
+        result["type_query"] = query
+
+        if result.get("found"):
+            _aircraft_photo_cache_put(cache_key, result)
+            return result
+
+        wiki_result = _aircraft_photo_wikimedia_thumbnail(query)
+        if wiki_result and wiki_result.get("found"):
+            _aircraft_photo_cache_put(cache_key, wiki_result)
+            return wiki_result
+
+    return {
+        "found": False,
+        "source": "type_fallback",
+        "query": queries[0],
+        "queries_tried": queries,
+        "cached": False,
+        "match_level": "none",
+        "representative": False,
+        "looked_up_utc": int(time.time()),
+        "message": "No representative aircraft type image found.",
+    }
+
+
+def _aircraft_photo_fallback_payload(query_string: str) -> tuple[dict, HTTPStatus]:
+    parameters = urllib.parse.parse_qs(query_string, keep_blank_values=True)
+
+    reg = _aircraft_photo_normalize_token((parameters.get("reg") or parameters.get("tail") or [""])[0])
+    callsign = _aircraft_photo_normalize_token((parameters.get("callsign") or parameters.get("flight") or [""])[0])
+    hex_value = _aircraft_photo_normalize_token((parameters.get("hex") or parameters.get("icao") or [""])[0])
+    aircraft_type = _aircraft_photo_normalize_token((parameters.get("type") or [""])[0])
+    model = _aircraft_photo_normalize_token((parameters.get("model") or [""])[0])
+    manufacturer = _aircraft_photo_normalize_token((parameters.get("manufacturer") or parameters.get("make") or [""])[0])
+    operator = _aircraft_photo_normalize_token((parameters.get("operator") or [""])[0])
+
+    terms = [term for term in (reg, callsign, hex_value, manufacturer, aircraft_type, model, operator) if term]
+    if not terms:
+        return {"error": "Missing aircraft photo search terms."}, HTTPStatus.BAD_REQUEST
+
+    query = " ".join(dict.fromkeys(terms))
+    cache_key = _aircraft_photo_cache_key("exact:" + query)
+
+    cached = _aircraft_photo_cache_get(cache_key)
+    if cached:
+        cached["match_level"] = cached.get("match_level") or "exact"
+        cached["representative"] = bool(cached.get("representative"))
+        return {"result": cached}, HTTPStatus.OK
+
+    result = _aircraft_photo_lookup_live(query, reg or callsign or hex_value or query)
+    if result.get("found"):
+        result["match_level"] = result.get("match_level") or "exact"
+        result["representative"] = False
+        _aircraft_photo_cache_put(cache_key, result)
+        return {"result": result}, HTTPStatus.OK
+
+    type_result = _aircraft_photo_lookup_representative_type(aircraft_type, model, manufacturer)
+    if type_result.get("found"):
+        type_result["exact_lookup_message"] = result.get("message")
+        return {"result": type_result}, HTTPStatus.OK
+
+    return {"result": result}, HTTPStatus.OK
+
+# /AIRCRAFT_PHOTO_MODEL_FALLBACK_IMPROVEMENT_PATCH_V1
+
+
+# AIRCRAFT_PHOTO_REJECT_LOGO_IMAGES_PATCH_V2
+# Reject site logos/social cards from aircraft photo fallback parsing.
+
+def _aircraft_photo_is_rejected_image_url(url: str) -> bool:
+    low = str(url or "").lower()
+    if not low:
+        return True
+
+    if not any(ext in low for ext in (".jpg", ".jpeg", ".png", ".webp")):
+        return True
+
+    reject_tokens = (
+        "logo",
+        "social",
+        "icon",
+        "avatar",
+        "sprite",
+        "blank",
+        "placeholder",
+        "favicon",
+        "apple-touch",
+        "loading",
+        "spinner",
+        "watermark",
+        "no-photo",
+        "no_photo",
+        "default",
+    )
+    return any(token in low for token in reject_tokens)
+
+
+def _aircraft_photo_first_image_from_html(html_text: str, page_url: str, source: str) -> str | None:
+    candidates: list[str] = []
+
+    # Inspect normal/lazy image attributes first.
+    for match in re.finditer(r'''(?:src|data-src|data-lazy|data-original)=["\']([^"\']+)["\']''', html_text, re.I):
+        src = _aircraft_photo_absolute_url(match.group(1), page_url)
+        low = src.lower()
+
+        if _aircraft_photo_is_rejected_image_url(src):
+            continue
+
+        if source == "jetphotos":
+            if "jetphotos" not in low and "cdn.jetphotos" not in low:
+                continue
+            if "/assets/" in low:
+                continue
+
+        if source == "planespotters":
+            if "planespotters" not in low and "cdn.planespotters" not in low:
+                continue
+            if "/assets/" in low:
+                continue
+
+        candidates.append(src)
+
+    # Meta og:image is a fallback only if it is not a site logo/social card.
+    for match in re.finditer(r'''property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']''', html_text, re.I):
+        src = _aircraft_photo_absolute_url(match.group(1), page_url)
+        low = src.lower()
+
+        if _aircraft_photo_is_rejected_image_url(src):
+            continue
+        if source == "jetphotos" and "/assets/" in low:
+            continue
+        if source == "planespotters" and "/assets/" in low:
+            continue
+
+        candidates.append(src)
+
+    return candidates[0] if candidates else None
+
+# /AIRCRAFT_PHOTO_REJECT_LOGO_IMAGES_PATCH_V2
+
+# AIRCRAFT_PHOTO_PRIORITIZE_BOEING_MAX_TERMS_PATCH_V2
+# Prioritize normalized Boeing 737 MAX model terms for representative photo fallback.
+
+def _aircraft_photo_expand_model_terms(manufacturer: str, aircraft_type: str, model: str) -> list[str]:
+    maker = _aircraft_photo_normalize_token(manufacturer)
+    aircraft_type = _aircraft_photo_normalize_token(aircraft_type)
+    model = _aircraft_photo_normalize_token(model)
+
+    raw_values = " ".join(part for part in (maker, model, aircraft_type) if part).upper()
+    shorthand_values = {value for value in (model.upper(), aircraft_type.upper()) if value}
+    terms: list[str] = []
+
+    def add(value: str) -> None:
+        value = _aircraft_photo_normalize_token(value)
+        if not value:
+            return
+        if "AIRCRAFT" not in value.upper():
+            value = value + " aircraft"
+        if value not in terms:
+            terms.append(value)
+
+    # Put normalized Boeing MAX terms first, before shorthand like 737-9.
+    if maker == "BOEING":
+        if (
+            "737-7" in raw_values or "737 MAX 7" in raw_values or
+            "737-7 MAX" in raw_values or "B37M" in shorthand_values
+        ):
+            add("Boeing 737 MAX 7")
+            add("Boeing 737-7 MAX")
+
+        if (
+            "737-8" in raw_values or "737 MAX 8" in raw_values or
+            "737-8 MAX" in raw_values or "B38M" in shorthand_values
+        ):
+            add("Boeing 737 MAX 8")
+            add("Boeing 737-8 MAX")
+
+        if (
+            "737-9" in raw_values or "737 MAX 9" in raw_values or
+            "737-9 MAX" in raw_values or "B39M" in shorthand_values
+        ):
+            add("Boeing 737 MAX 9")
+            add("Boeing 737-9 MAX")
+
+        if (
+            "737-10" in raw_values or "737 MAX 10" in raw_values or
+            "737-10 MAX" in raw_values or "B3XM" in shorthand_values
+        ):
+            add("Boeing 737 MAX 10")
+            add("Boeing 737-10 MAX")
+
+    if maker in {"EMBRAER", "EMB"} and ("175" in raw_values or "E175" in raw_values):
+        add("Embraer E175")
+        add("Embraer 175")
+
+    if maker == "AIRBUS":
+        if model.startswith("A") or aircraft_type.startswith("A"):
+            add("Airbus " + (model or aircraft_type))
+
+    # Generic terms after normalized terms.
+    add(" ".join(part for part in (maker, model or aircraft_type) if part).strip())
+    add(" ".join(part for part in (maker, aircraft_type) if part).strip())
+    add(model)
+    add(aircraft_type)
+
+    return terms
+
+# /AIRCRAFT_PHOTO_PRIORITIZE_BOEING_MAX_TERMS_PATCH_V2
+
+# AIRCRAFT_PHOTO_SMART_MODEL_QUERY_PATCH_V1
+# Smart aircraft model query expansion for representative photo fallback.
+# This avoids per-aircraft hardcoding by normalizing messy model strings
+# such as 737MAX 8, B737MAX8, A320NEO, EMB175, etc.
+
+def _aircraft_photo_compact_model_tokens(value: str) -> str:
+    text = _aircraft_photo_normalize_token(value).upper()
+    text = text.replace("-", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def _aircraft_photo_smart_model_queries(manufacturer: str, aircraft_type: str, model: str) -> list[str]:
+    maker = _aircraft_photo_normalize_token(manufacturer)
+    aircraft_type = _aircraft_photo_normalize_token(aircraft_type)
+    model = _aircraft_photo_normalize_token(model)
+    raw = " ".join(part for part in (maker, model, aircraft_type) if part).strip()
+    compact = _aircraft_photo_compact_model_tokens(raw)
+    compact_no_space = compact.replace(" ", "")
+    queries: list[str] = []
+
+    def add(value: str) -> None:
+        value = str(value or "").strip()
+        value = re.sub(r"\s+", " ", value)
+        if not value:
+            return
+        if "aircraft" not in value.lower() and "airliner" not in value.lower():
+            value = value + " aircraft"
+        if value not in queries:
+            queries.append(value)
+
+    # Generic Boeing 737 MAX recognizer. Handles 737MAX8, 737MAX 8, 737 MAX-8, B38M, etc.
+    max_match = re.search(r"(?:B?737|BOEING737)\s*(?:MAX)?\s*([789]|10)\b", compact_no_space)
+    if "737MAX" in compact_no_space or "B37M" in compact_no_space or "B38M" in compact_no_space or "B39M" in compact_no_space or "B3XM" in compact_no_space:
+        if "B37M" in compact_no_space:
+            variant = "7"
+        elif "B38M" in compact_no_space:
+            variant = "8"
+        elif "B39M" in compact_no_space:
+            variant = "9"
+        elif "B3XM" in compact_no_space:
+            variant = "10"
+        else:
+            m = re.search(r"737MAX(10|[789])", compact_no_space)
+            variant = m.group(1) if m else ""
+        if variant:
+            add(f"Boeing 737 MAX {variant}")
+            add(f"737 MAX {variant}")
+
+    # Generic Boeing 737 dash shorthand. Handles 737-8 as 737 MAX 8 but without a hardcoded table.
+    dash_match = re.search(r"(?:B?737|BOEING737)\s*(10|[789])\b", compact_no_space)
+    if maker == "BOEING" and dash_match:
+        variant = dash_match.group(1)
+        add(f"Boeing 737 MAX {variant}")
+        add(f"737 MAX {variant}")
+
+    # Airbus neo/ceo style normalization.
+    airbus_match = re.search(r"A(318|319|320|321|330|340|350|380)(NEO|CEO)?", compact_no_space)
+    if maker == "AIRBUS" and airbus_match:
+        family = airbus_match.group(1)
+        suffix = airbus_match.group(2) or ""
+        add(f"Airbus A{family}{suffix}")
+        if suffix:
+            add(f"Airbus A{family} {suffix}")
+
+    # Embraer E-Jet shorthand normalization.
+    emb_match = re.search(r"(?:E|EMB|ERJ)?\s*(170|175|190|195)", compact_no_space)
+    if maker in {"EMBRAER", "EMB", "ERJ"} and emb_match:
+        variant = emb_match.group(1)
+        add(f"Embraer E{variant}")
+        add(f"Embraer {variant}")
+
+    # Generic phrase expansion. These are still useful for unusual aircraft.
+    add(" ".join(part for part in (maker, model or aircraft_type) if part).strip())
+    add(" ".join(part for part in (maker, aircraft_type) if part).strip())
+    add(raw)
+    add(model)
+    add(aircraft_type)
+
+    # Add explicit photo/search intent versions for sites that rank better with these terms.
+    expanded: list[str] = []
+    for query in queries:
+        for candidate in (query, query.replace(" aircraft", " airliner"), query.replace(" aircraft", " photo")):
+            candidate = re.sub(r"\s+", " ", candidate).strip()
+            if candidate and candidate not in expanded:
+                expanded.append(candidate)
+    return expanded
+
+def _aircraft_photo_expand_model_terms(manufacturer: str, aircraft_type: str, model: str) -> list[str]:
+    return _aircraft_photo_smart_model_queries(manufacturer, aircraft_type, model)
+
+# /AIRCRAFT_PHOTO_SMART_MODEL_QUERY_PATCH_V1
+
+# AIRCRAFT_PHOTO_MODEL_SYNONYM_QUERY_PATCH_V1
+# Add synonym-style aircraft model query expansion for representative photo fallback.
+# This handles common database/model text like ERJ 170-200 LR -> Embraer E175
+# and messy Boeing MAX strings without relying on aircraft tail numbers.
+
+def _aircraft_photo_smart_model_queries(manufacturer: str, aircraft_type: str, model: str) -> list[str]:
+    maker = _aircraft_photo_normalize_token(manufacturer)
+    aircraft_type = _aircraft_photo_normalize_token(aircraft_type)
+    model = _aircraft_photo_normalize_token(model)
+    raw = ' '.join(part for part in (maker, model, aircraft_type) if part).strip()
+    raw_upper = raw.upper()
+    compact = re.sub(r'[^A-Z0-9]+', '', raw_upper)
+    queries: list[str] = []
+
+    def add(value: str) -> None:
+        value = str(value or '').strip()
+        value = re.sub(r'\s+', ' ', value)
+        if not value:
+            return
+        if 'aircraft' not in value.lower() and 'airliner' not in value.lower() and 'photo' not in value.lower():
+            value = value + ' aircraft'
+        if value not in queries:
+            queries.append(value)
+
+    # Boeing 737 MAX family. Handles 737-8, 737MAX 8, 737MAX8, B38M, 737-9, etc.
+    if maker == 'BOEING' or 'BOEING' in raw_upper or '737' in raw_upper:
+        variant = ''
+        if 'B37M' in compact:
+            variant = '7'
+        elif 'B38M' in compact:
+            variant = '8'
+        elif 'B39M' in compact:
+            variant = '9'
+        elif 'B3XM' in compact:
+            variant = '10'
+        else:
+            m = re.search(r'737(?:MAX)?(10|[789])', compact)
+            if m:
+                variant = m.group(1)
+        if variant:
+            add(f'Boeing 737 MAX {variant}')
+            add(f'737 MAX {variant}')
+            add(f'Boeing 737-{variant} MAX')
+
+    # Embraer E-Jet family. Many databases report E175 as ERJ 170-200 LR/LL.
+    if maker in {'EMBRAER', 'EMB', 'ERJ'} or 'EMBRAER' in raw_upper or 'ERJ' in raw_upper or 'EMB' in raw_upper:
+        if any(token in compact for token in ('ERJ170200', 'ERJ175', 'EMB175', 'E175', '170200')):
+            add('Embraer E175')
+            add('Embraer 175')
+            add('Embraer ERJ-175')
+            add('Embraer 170-200')
+        elif any(token in compact for token in ('ERJ170100', 'EMB170', 'E170')):
+            add('Embraer E170')
+            add('Embraer 170')
+        elif any(token in compact for token in ('ERJ190', 'EMB190', 'E190')):
+            add('Embraer E190')
+            add('Embraer 190')
+        elif any(token in compact for token in ('ERJ195', 'EMB195', 'E195')):
+            add('Embraer E195')
+            add('Embraer 195')
+
+    # Airbus generic recognition.
+    if maker == 'AIRBUS' or 'AIRBUS' in raw_upper:
+        m = re.search(r'A(318|319|320|321|330|340|350|380)(NEO|CEO)?', compact)
+        if m:
+            family = m.group(1)
+            suffix = m.group(2) or ''
+            add(f'Airbus A{family}{suffix}')
+            if suffix:
+                add(f'Airbus A{family} {suffix}')
+
+    # Generic phrase expansion after synonyms.
+    add(' '.join(part for part in (maker, model or aircraft_type) if part).strip())
+    add(' '.join(part for part in (maker, aircraft_type) if part).strip())
+    add(raw)
+    add(model)
+    add(aircraft_type)
+
+    # Add intent variants. Wikimedia tends to do well with aircraft/airliner,
+    # while photo-site searches often rank better with photo.
+    expanded: list[str] = []
+    for query in queries:
+        variants = [
+            query,
+            query.replace(' aircraft', ' airliner'),
+            query.replace(' aircraft', ' photo'),
+        ]
+        for candidate in variants:
+            candidate = re.sub(r'\s+', ' ', candidate).strip()
+            if candidate and candidate not in expanded:
+                expanded.append(candidate)
+    return expanded
+
+def _aircraft_photo_expand_model_terms(manufacturer: str, aircraft_type: str, model: str) -> list[str]:
+    return _aircraft_photo_smart_model_queries(manufacturer, aircraft_type, model)
+
+# /AIRCRAFT_PHOTO_MODEL_SYNONYM_QUERY_PATCH_V1
+
+# AIRCRAFT_PHOTO_AIRBUS_MODEL_SYNONYM_PATCH_V1
+# Add stronger Airbus model synonym/query expansion for representative photo fallback.
+# Handles strings such as A320 214, A320-214, A321 271N, A319 112, etc.
+
+def _aircraft_photo_smart_model_queries(manufacturer: str, aircraft_type: str, model: str) -> list[str]:
+    maker = _aircraft_photo_normalize_token(manufacturer)
+    aircraft_type = _aircraft_photo_normalize_token(aircraft_type)
+    model = _aircraft_photo_normalize_token(model)
+    raw = " ".join(part for part in (maker, model, aircraft_type) if part).strip()
+    raw_upper = raw.upper()
+    compact = re.sub(r"[^A-Z0-9]+", "", raw_upper)
+    queries: list[str] = []
+
+    def add(value: str) -> None:
+        value = str(value or "").strip()
+        value = re.sub(r"\s+", " ", value)
+        if not value:
+            return
+        if "aircraft" not in value.lower() and "airliner" not in value.lower() and "photo" not in value.lower():
+            value = value + " aircraft"
+        if value not in queries:
+            queries.append(value)
+
+    # Boeing 737 MAX family normalization.
+    if maker == "BOEING" or "BOEING" in raw_upper or "737" in raw_upper:
+        variant = ""
+        if "B37M" in compact:
+            variant = "7"
+        elif "B38M" in compact:
+            variant = "8"
+        elif "B39M" in compact:
+            variant = "9"
+        elif "B3XM" in compact:
+            variant = "10"
+        else:
+            m = re.search(r"737(?:MAX)?(10|[789])", compact)
+            if m:
+                variant = m.group(1)
+        if variant:
+            add(f"Boeing 737 MAX {variant}")
+            add(f"737 MAX {variant}")
+            add(f"Boeing 737-{variant} MAX")
+
+    # Embraer E-Jet family synonyms.
+    if maker in {"EMBRAER", "EMB", "ERJ"} or "EMBRAER" in raw_upper or "ERJ" in raw_upper or "EMB" in raw_upper:
+        if any(token in compact for token in ("ERJ170200", "ERJ175", "EMB175", "E175", "170200")):
+            add("Embraer E175")
+            add("Embraer 175")
+            add("Embraer ERJ-175")
+            add("Embraer 170-200")
+        elif any(token in compact for token in ("ERJ170100", "EMB170", "E170")):
+            add("Embraer E170")
+            add("Embraer 170")
+        elif any(token in compact for token in ("ERJ190", "EMB190", "E190")):
+            add("Embraer E190")
+            add("Embraer 190")
+        elif any(token in compact for token in ("ERJ195", "EMB195", "E195")):
+            add("Embraer E195")
+            add("Embraer 195")
+
+    # Airbus family and subtype synonyms. A320 214 = A320-214 / A320ceo family.
+    airbus_like = maker == "AIRBUS" or "AIRBUS" in raw_upper or compact.startswith("A3")
+    if airbus_like:
+        m = re.search(r"A(318|319|320|321|330|340|350|380)([0-9A-Z]{0,4})", compact)
+        if m:
+            family = m.group(1)
+            subtype = m.group(2) or ""
+            add(f"Airbus A{family}")
+            if subtype:
+                add(f"Airbus A{family}-{subtype}")
+                add(f"Airbus A{family} {subtype}")
+            if family in {"318", "319", "320", "321"}:
+                add(f"Airbus A{family} family")
+                # 3-digit non-N suffixes are usually ceo-family variants, e.g. A320-214.
+                if subtype and not subtype.endswith("N"):
+                    add(f"Airbus A{family}ceo")
+                if subtype.endswith("N") or "NEO" in compact:
+                    add(f"Airbus A{family}neo")
+            elif family == "350":
+                add("Airbus A350")
+            elif family == "380":
+                add("Airbus A380")
+
+    # Generic phrase expansion after synonyms.
+    add(" ".join(part for part in (maker, model or aircraft_type) if part).strip())
+    add(" ".join(part for part in (maker, aircraft_type) if part).strip())
+    add(raw)
+    add(model)
+    add(aircraft_type)
+
+    expanded: list[str] = []
+    for query in queries:
+        variants = [query, query.replace(" aircraft", " airliner"), query.replace(" aircraft", " photo")]
+        for candidate in variants:
+            candidate = re.sub(r"\s+", " ", candidate).strip()
+            if candidate and candidate not in expanded:
+                expanded.append(candidate)
+    return expanded
+
+def _aircraft_photo_expand_model_terms(manufacturer: str, aircraft_type: str, model: str) -> list[str]:
+    return _aircraft_photo_smart_model_queries(manufacturer, aircraft_type, model)
+
+# /AIRCRAFT_PHOTO_AIRBUS_MODEL_SYNONYM_PATCH_V1
+
+# AIRCRAFT_PHOTO_COMMONS_OPERATOR_FALLBACK_PATCH_V1
+# Add Wikimedia Commons + operator-aware representative photo fallback.
+
+def _aircraft_photo_wikimedia_commons_thumbnail(query: str) -> dict | None:
+    search = _aircraft_photo_urlparse.urlencode({
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrnamespace": "6",
+        "gsrlimit": "8",
+        "prop": "imageinfo|info",
+        "iiprop": "url|mime",
+        "iiurlwidth": "1000",
+        "inprop": "url",
+        "origin": "*",
+    })
+    url = "https://commons.wikimedia.org/w/api.php?" + search
+    try:
+        request = _aircraft_photo_urlrequest.Request(
+            url,
+            headers={
+                "User-Agent": "RTL-Pi-ADS-B-Tracker aircraft representative photo fallback",
+                "Accept": "application/json",
+            },
+        )
+        with _aircraft_photo_urlrequest.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        pages = list((payload.get("query") or {}).get("pages", {}).values())
+        pages.sort(key=lambda page: int(page.get("index") or 9999))
+        for page in pages:
+            infos = page.get("imageinfo") or []
+            if not infos:
+                continue
+            info = infos[0]
+            mime = str(info.get("mime") or "").lower()
+            image_url = info.get("thumburl") or info.get("url")
+            if not image_url:
+                continue
+            if mime and not mime.startswith("image/"):
+                continue
+            if _aircraft_photo_is_rejected_image_url(image_url):
+                continue
+            return {
+                "found": True,
+                "source": "Wikimedia Commons",
+                "page_url": page.get("fullurl") or f"https://commons.wikimedia.org/?curid={page.get('pageid')}",
+                "image_url": image_url,
+                "query": query,
+                "cached": False,
+                "match_level": "type",
+                "representative": True,
+                "type_query": query,
+                "looked_up_utc": int(time.time()),
+            }
+    except Exception:
+        return None
+    return None
+
+def _aircraft_photo_operator_queries(operator: str, manufacturer: str, aircraft_type: str, model: str) -> list[str]:
+    operator = _aircraft_photo_normalize_token(operator)
+    base_queries = _aircraft_photo_expand_model_terms(manufacturer, aircraft_type, model)
+    if not operator:
+        return base_queries
+    expanded: list[str] = []
+    for query in base_queries:
+        cleaned = re.sub(r"\b(aircraft|airliner|photo)\b", "", query, flags=re.I).strip()
+        for candidate in (
+            f"{operator} {cleaned} aircraft",
+            f"{operator} {cleaned} airliner",
+            f"{cleaned} {operator} aircraft",
+            query,
+        ):
+            candidate = re.sub(r"\s+", " ", candidate).strip()
+            if candidate and candidate not in expanded:
+                expanded.append(candidate)
+    return expanded
+
+def _aircraft_photo_lookup_representative_type(aircraft_type: str, model: str, manufacturer: str = "", operator: str = "") -> dict:
+    queries = _aircraft_photo_operator_queries(operator, manufacturer, aircraft_type, model)
+    if not queries:
+        return {
+            "found": False,
+            "source": "type_fallback",
+            "query": "",
+            "cached": False,
+            "match_level": "none",
+            "representative": False,
+            "looked_up_utc": int(time.time()),
+            "message": "No aircraft manufacturer/type/model available for representative photo lookup.",
+        }
+    for query in queries:
+        cache_key = _aircraft_photo_cache_key("type:" + query)
+        cached = _aircraft_photo_cache_get(cache_key)
+        if cached:
+            cached["match_level"] = cached.get("match_level") or "type"
+            cached["representative"] = True
+            cached["type_query"] = cached.get("type_query") or query
+            return cached
+        result = _aircraft_photo_lookup_live(query, query)
+        result["match_level"] = "type" if result.get("found") else "none"
+        result["representative"] = bool(result.get("found"))
+        result["type_query"] = query
+        if result.get("found"):
+            _aircraft_photo_cache_put(cache_key, result)
+            return result
+        wiki_result = _aircraft_photo_wikimedia_thumbnail(query)
+        if wiki_result and wiki_result.get("found"):
+            _aircraft_photo_cache_put(cache_key, wiki_result)
+            return wiki_result
+        commons_result = _aircraft_photo_wikimedia_commons_thumbnail(query)
+        if commons_result and commons_result.get("found"):
+            _aircraft_photo_cache_put(cache_key, commons_result)
+            return commons_result
+    return {
+        "found": False,
+        "source": "type_fallback",
+        "query": queries[0],
+        "queries_tried": queries[:20],
+        "cached": False,
+        "match_level": "none",
+        "representative": False,
+        "looked_up_utc": int(time.time()),
+        "message": "No representative aircraft type image found.",
+    }
+
+def _aircraft_photo_fallback_payload(query_string: str) -> tuple[dict, HTTPStatus]:
+    parameters = urllib.parse.parse_qs(query_string, keep_blank_values=True)
+    reg = _aircraft_photo_normalize_token((parameters.get("reg") or parameters.get("tail") or [""])[0])
+    callsign = _aircraft_photo_normalize_token((parameters.get("callsign") or parameters.get("flight") or [""])[0])
+    hex_value = _aircraft_photo_normalize_token((parameters.get("hex") or parameters.get("icao") or [""])[0])
+    aircraft_type = _aircraft_photo_normalize_token((parameters.get("type") or [""])[0])
+    model = _aircraft_photo_normalize_token((parameters.get("model") or [""])[0])
+    manufacturer = _aircraft_photo_normalize_token((parameters.get("manufacturer") or parameters.get("make") or [""])[0])
+    operator = _aircraft_photo_normalize_token((parameters.get("operator") or [""])[0])
+    terms = [term for term in (reg, callsign, hex_value, manufacturer, aircraft_type, model, operator) if term]
+    if not terms:
+        return {"error": "Missing aircraft photo search terms."}, HTTPStatus.BAD_REQUEST
+    query = " ".join(dict.fromkeys(terms))
+    cache_key = _aircraft_photo_cache_key("exact:" + query)
+    cached = _aircraft_photo_cache_get(cache_key)
+    if cached:
+        cached["match_level"] = cached.get("match_level") or "exact"
+        cached["representative"] = bool(cached.get("representative"))
+        return {"result": cached}, HTTPStatus.OK
+    result = _aircraft_photo_lookup_live(query, reg or callsign or hex_value or query)
+    if result.get("found"):
+        result["match_level"] = result.get("match_level") or "exact"
+        result["representative"] = False
+        _aircraft_photo_cache_put(cache_key, result)
+        return {"result": result}, HTTPStatus.OK
+    type_result = _aircraft_photo_lookup_representative_type(aircraft_type, model, manufacturer, operator)
+    if type_result.get("found"):
+        type_result["exact_lookup_message"] = result.get("message")
+        return {"result": type_result}, HTTPStatus.OK
+    return {"result": result}, HTTPStatus.OK
+
+# /AIRCRAFT_PHOTO_COMMONS_OPERATOR_FALLBACK_PATCH_V1
+
+# AIRCRAFT_PHOTO_STRICT_IMAGE_FILTER_PATCH_V1
+# Final strict filter for representative aircraft photo fallback results.
+# Rejects logos, SVG-derived logo thumbnails, icons, and other non-aircraft assets.
+
+def _aircraft_photo_is_rejected_image_url(url: str) -> bool:
+    low = str(url or "").lower()
+    if not low:
+        return True
+    if not any(ext in low for ext in (".jpg", ".jpeg", ".png", ".webp")):
+        return True
+    reject_tokens = (
+        "logo", "svg", "icon", "avatar", "sprite", "blank", "placeholder",
+        "favicon", "apple-touch", "loading", "spinner", "watermark",
+        "no-photo", "no_photo", "default", "seal", "emblem", "wordmark"
+    )
+    return any(token in low for token in reject_tokens)
+
+def _aircraft_photo_page_looks_like_logo(page: dict, image_url: str) -> bool:
+    title = str(page.get("title") or "").lower()
+    fullurl = str(page.get("fullurl") or "").lower()
+    low = str(image_url or "").lower()
+    reject_tokens = ("logo", "seal", "emblem", "wordmark", "svg")
+    return any(token in title or token in fullurl or token in low for token in reject_tokens)
+
+def _aircraft_photo_wikimedia_thumbnail(query: str) -> dict | None:
+    search = _aircraft_photo_urlparse.urlencode({
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrlimit": "8",
+        "prop": "pageimages|info",
+        "pithumbsize": "900",
+        "inprop": "url",
+        "origin": "*",
+    })
+    url = "https://en.wikipedia.org/w/api.php?" + search
+    try:
+        request = _aircraft_photo_urlrequest.Request(
+            url,
+            headers={
+                "User-Agent": "RTL-Pi-ADS-B-Tracker aircraft representative photo fallback",
+                "Accept": "application/json",
+            },
+        )
+        with _aircraft_photo_urlrequest.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        pages = list((payload.get("query") or {}).get("pages", {}).values())
+        pages.sort(key=lambda page: int(page.get("index") or 9999))
+        for page in pages:
+            thumbnail = page.get("thumbnail") or {}
+            image_url = thumbnail.get("source")
+            if not image_url:
+                continue
+            if _aircraft_photo_is_rejected_image_url(image_url):
+                continue
+            if _aircraft_photo_page_looks_like_logo(page, image_url):
+                continue
+            return {
+                "found": True,
+                "source": "Wikimedia",
+                "page_url": page.get("fullurl") or f"https://en.wikipedia.org/?curid={page.get('pageid')}",
+                "image_url": image_url,
+                "query": query,
+                "cached": False,
+                "match_level": "type",
+                "representative": True,
+                "type_query": query,
+                "looked_up_utc": int(time.time()),
+            }
+    except Exception:
+        return None
+    return None
+
+def _aircraft_photo_wikimedia_commons_thumbnail(query: str) -> dict | None:
+    search = _aircraft_photo_urlparse.urlencode({
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrnamespace": "6",
+        "gsrlimit": "12",
+        "prop": "imageinfo|info",
+        "iiprop": "url|mime",
+        "iiurlwidth": "1000",
+        "inprop": "url",
+        "origin": "*",
+    })
+    url = "https://commons.wikimedia.org/w/api.php?" + search
+    try:
+        request = _aircraft_photo_urlrequest.Request(
+            url,
+            headers={
+                "User-Agent": "RTL-Pi-ADS-B-Tracker aircraft representative photo fallback",
+                "Accept": "application/json",
+            },
+        )
+        with _aircraft_photo_urlrequest.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        pages = list((payload.get("query") or {}).get("pages", {}).values())
+        pages.sort(key=lambda page: int(page.get("index") or 9999))
+        for page in pages:
+            infos = page.get("imageinfo") or []
+            if not infos:
+                continue
+            info = infos[0]
+            mime = str(info.get("mime") or "").lower()
+            image_url = info.get("thumburl") or info.get("url")
+            if not image_url:
+                continue
+            if mime and not mime.startswith("image/"):
+                continue
+            if _aircraft_photo_is_rejected_image_url(image_url):
+                continue
+            if _aircraft_photo_page_looks_like_logo(page, image_url):
+                continue
+            return {
+                "found": True,
+                "source": "Wikimedia Commons",
+                "page_url": page.get("fullurl") or f"https://commons.wikimedia.org/?curid={page.get('pageid')}",
+                "image_url": image_url,
+                "query": query,
+                "cached": False,
+                "match_level": "type",
+                "representative": True,
+                "type_query": query,
+                "looked_up_utc": int(time.time()),
+            }
+    except Exception:
+        return None
+    return None
+
+# /AIRCRAFT_PHOTO_STRICT_IMAGE_FILTER_PATCH_V1
+
+# AIRCRAFT_PHOTO_MORE_MODEL_SYNONYMS_PATCH_V1
+# Add broader model synonym/query expansion for common missing representative aircraft photos.
+# Covers Airbus A321-271NX, Boeing 737NG 900ER/W, Boeing 757 26D/W, and related variants.
+
+def _aircraft_photo_smart_model_queries(manufacturer: str, aircraft_type: str, model: str) -> list[str]:
+    maker = _aircraft_photo_normalize_token(manufacturer)
+    aircraft_type = _aircraft_photo_normalize_token(aircraft_type)
+    model = _aircraft_photo_normalize_token(model)
+    raw = " ".join(part for part in (maker, model, aircraft_type) if part).strip()
+    raw_upper = raw.upper()
+    compact = re.sub(r"[^A-Z0-9]+", "", raw_upper)
+    queries: list[str] = []
+
+    def add(value: str) -> None:
+        value = str(value or "").strip()
+        value = re.sub(r"\s+", " ", value)
+        if not value:
+            return
+        if "aircraft" not in value.lower() and "airliner" not in value.lower() and "photo" not in value.lower():
+            value = value + " aircraft"
+        if value not in queries:
+            queries.append(value)
+
+    operator_context = ""  # operator remains handled by _aircraft_photo_operator_queries()
+
+    # Airbus A320/A321 family, including subtype strings like A321-271NX and A320 214.
+    airbus_like = maker == "AIRBUS" or "AIRBUS" in raw_upper or compact.startswith("A3")
+    if airbus_like:
+        m = re.search(r"A(318|319|320|321|330|340|350|380)([0-9A-Z]{0,5})", compact)
+        if m:
+            family = m.group(1)
+            subtype = m.group(2) or ""
+            add(f"Airbus A{family}")
+            if subtype:
+                add(f"Airbus A{family}-{subtype}")
+                add(f"Airbus A{family} {subtype}")
+            if family in {"318", "319", "320", "321"}:
+                add(f"Airbus A{family} family")
+                if subtype.endswith("N") or "NEO" in compact or "NX" in subtype:
+                    add(f"Airbus A{family}neo")
+                    add(f"Airbus A{family} neo")
+                else:
+                    add(f"Airbus A{family}ceo")
+            elif family == "350":
+                add("Airbus A350")
+            elif family == "380":
+                add("Airbus A380")
+
+    # Boeing 737 MAX and 737NG family.
+    boeing_like = maker == "BOEING" or "BOEING" in raw_upper or "737" in raw_upper or "757" in raw_upper
+    if boeing_like:
+        # 737 MAX variants: 737-8, 737MAX8, B38M, etc.
+        max_variant = ""
+        if "B37M" in compact:
+            max_variant = "7"
+        elif "B38M" in compact:
+            max_variant = "8"
+        elif "B39M" in compact:
+            max_variant = "9"
+        elif "B3XM" in compact:
+            max_variant = "10"
+        else:
+            m = re.search(r"737(?:MAX)?(10|[789])", compact)
+            if m and ("MAX" in compact or re.search(r"737[- ]?(10|[789])", raw_upper)):
+                max_variant = m.group(1)
+        if max_variant:
+            add(f"Boeing 737 MAX {max_variant}")
+            add(f"737 MAX {max_variant}")
+            add(f"Boeing 737-{max_variant} MAX")
+
+        # 737NG / 900ER / winglet variants, e.g. 737NG 900ER/W.
+        if "737NG" in compact or "737900" in compact or "900ER" in compact or "B739" in compact:
+            add("Boeing 737-900ER")
+            add("Boeing 737-900 ER")
+            add("Boeing 737-900")
+            add("Boeing 737NG 900ER")
+            add("Boeing 737-900ER winglets")
+        elif "737800" in compact or "738" == compact or "B738" in compact:
+            add("Boeing 737-800")
+            add("Boeing 737NG 800")
+            add("Boeing 737-800 winglets")
+        elif "737700" in compact or "B737700" in compact or "B737" in compact:
+            add("Boeing 737-700")
+            add("Boeing 737NG 700")
+
+        # Boeing 757 subtype strings: 757 26D/W -> 757-200 with winglets.
+        if "757" in compact:
+            add("Boeing 757-200")
+            add("Boeing 757-200 winglets")
+            add("Boeing 757-26D")
+            add("Boeing 757")
+            if "300" in compact:
+                add("Boeing 757-300")
+
+    # Embraer E-Jet family. EMB-175 LL and ERJ 170-200 LR/LL are E175-family.
+    if maker in {"EMBRAER", "EMB", "ERJ"} or "EMBRAER" in raw_upper or "ERJ" in raw_upper or "EMB" in raw_upper:
+        if any(token in compact for token in ("ERJ170200", "ERJ175", "EMB175", "E175", "170200", "EMB175LL", "EMB175LR")):
+            add("Embraer E175")
+            add("Embraer 175")
+            add("Embraer ERJ-175")
+            add("Embraer 170-200")
+        elif any(token in compact for token in ("ERJ170100", "EMB170", "E170")):
+            add("Embraer E170")
+            add("Embraer 170")
+        elif any(token in compact for token in ("ERJ190", "EMB190", "E190")):
+            add("Embraer E190")
+            add("Embraer 190")
+        elif any(token in compact for token in ("ERJ195", "EMB195", "E195")):
+            add("Embraer E195")
+            add("Embraer 195")
+
+    # Generic phrase expansion after known synonyms.
+    add(" ".join(part for part in (maker, model or aircraft_type) if part).strip())
+    add(" ".join(part for part in (maker, aircraft_type) if part).strip())
+    add(raw)
+    add(model)
+    add(aircraft_type)
+
+    expanded: list[str] = []
+    for query in queries:
+        variants = [query, query.replace(" aircraft", " airliner"), query.replace(" aircraft", " photo")]
+        for candidate in variants:
+            candidate = re.sub(r"\s+", " ", candidate).strip()
+            if candidate and candidate not in expanded:
+                expanded.append(candidate)
+    return expanded
+
+def _aircraft_photo_expand_model_terms(manufacturer: str, aircraft_type: str, model: str) -> list[str]:
+    return _aircraft_photo_smart_model_queries(manufacturer, aircraft_type, model)
+
+# /AIRCRAFT_PHOTO_MORE_MODEL_SYNONYMS_PATCH_V1
+
 if __name__ == "__main__":
     main()

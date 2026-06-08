@@ -383,6 +383,32 @@ body { padding: 0; }
     font-variant-numeric: tabular-nums;
   }
 </style>
+<style>
+  /* AIRCRAFT_PHOTO_SPINNER_UNTIL_COMPLETE_PATCH_V1 */
+  .aircraft-photo-loading {
+    display: inline-flex !important;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+
+  .aircraft-photo-loading::before {
+    content: "";
+    display: inline-block;
+    width: 13px;
+    height: 13px;
+    border: 2px solid rgba(150, 150, 150, 0.45);
+    border-top-color: currentColor;
+    border-radius: 50%;
+    animation: aircraft-photo-spin 0.85s linear infinite;
+  }
+
+  @keyframes aircraft-photo-spin {
+    to { transform: rotate(360deg); }
+  }
+  /* /AIRCRAFT_PHOTO_SPINNER_UNTIL_COMPLETE_PATCH_V1 */
+</style>
+
 </head>
 <body>
 <header class="app-header">
@@ -811,6 +837,26 @@ function removeTrailLayers() {
   }
   aircraftTrailSegments.clear();
 }
+
+// ACTIVE_TRAILS_CLEAR_WHEN_AIRCRAFT_EXITS_PATCH_V2
+// Remove only currently displayed active trail segments for one aircraft.
+// This intentionally does not delete aircraftTrailHistory, so Restore History
+// can bring the old trail back later.
+function removeActiveTrailLayersForAircraft(key) {
+  if (!aircraftMap || !key) return;
+  const segments = aircraftTrailSegments.get(key) || [];
+  for (const segment of segments) {
+    try {
+      aircraftMap.removeLayer(segment);
+    } catch (_error) {
+      // Ignore stale Leaflet layer references.
+    }
+  }
+  aircraftTrailSegments.delete(key);
+}
+
+// /ACTIVE_TRAILS_CLEAR_WHEN_AIRCRAFT_EXITS_PATCH_V2
+
 function formatTrailLastSeen(timestamp) {
   const milliseconds = Number(timestamp);
   if (!Number.isFinite(milliseconds) || milliseconds <= 0) return 'Unknown';
@@ -869,7 +915,7 @@ function addTrailSegment(key, prior, current) {
 
   const flight = String(current.flight || prior.flight || '').trim();
   const identifier = flight || String(current.hex || prior.hex || key || '').toUpperCase();
-  const identifierLabel = flight ? 'Flight' : 'Aircraft';
+  const identifierLabel = flight ? 'Call Sign' : 'ICAO';
   const lastSeen = formatTrailLastSeen(current.time || prior.time);
   if (identifier) {
     const tooltipHeader =
@@ -1037,6 +1083,7 @@ function updateAircraftMap(aircraftRecords) {
   for (const [key, marker] of aircraftMapMarkers.entries()) {
     if (!visibleIds.has(key)) {
       aircraftMap.removeLayer(marker);
+      removeActiveTrailLayersForAircraft(key);
       aircraftMapMarkers.delete(key);
       aircraftLastPositions.delete(key);
     }
@@ -1217,7 +1264,121 @@ function likelyTailNumber(value) {
     /^[A-Z]{1,2}-[A-Z0-9]{2,6}$/.test(text) ||
     /^[A-Z]{2,5}[0-9]{1,5}$/.test(text);
 }
-function setAircraftPhotoCandidates(urls, description) {
+// AIRCRAFT_PHOTO_NATIVE_RENDER_FALLBACK_PATCH_V1
+function normalizeAircraftPhotoTerm(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text || text === '—') return '';
+  const lowered = text.toLowerCase();
+  if (lowered === 'unavailable' || lowered === 'not broadcast' || lowered.startsWith('loading')) return '';
+  return text;
+}
+
+function setNativeAircraftFallbackCredit(result) {
+  const note = document.querySelector('.photo-source-note');
+  if (!note) return;
+  if (!note.dataset.originalText) note.dataset.originalText = note.textContent;
+  const source = result && result.source ? result.source : 'fallback source';
+  const credit = result && (result.representative || result.match_level === 'type')
+    ? `Photo: representative aircraft type image from ${source}.`
+    : `Photo: best guess from ${source}.`;
+  note.textContent = `${note.dataset.originalText} ${credit}`;
+}
+
+function clearNativeAircraftFallbackCredit() {
+  const note = document.querySelector('.photo-source-note');
+  if (note && note.dataset.originalText) {
+    note.textContent = note.dataset.originalText;
+  }
+}
+
+// AIRCRAFT_PHOTO_SPINNER_UNTIL_COMPLETE_PATCH_V1
+function setAircraftPhotoLoading(message, text = 'Looking up aircraft photo…') {
+  if (!message) return;
+  message.style.display = 'block';
+  message.classList.add('aircraft-photo-loading');
+  message.textContent = text;
+}
+
+function setAircraftPhotoFinalMessage(message, text) {
+  if (!message) return;
+  message.classList.remove('aircraft-photo-loading');
+  message.style.display = 'block';
+  message.textContent = text || 'No photograph available for this aircraft.';
+}
+
+// /AIRCRAFT_PHOTO_SPINNER_UNTIL_COMPLETE_PATCH_V1
+
+function buildAircraftPhotoFallbackUrl(fallbackTerms) {
+  const params = new URLSearchParams();
+  const terms = fallbackTerms || {};
+  for (const [key, value] of Object.entries(terms)) {
+    const cleaned = normalizeAircraftPhotoTerm(value);
+    if (cleaned) params.set(key, cleaned);
+  }
+  return params.toString() ? `/api/aircraft/photo/fallback?${params.toString()}` : '';
+}
+
+async function loadNativeAircraftFallbackPhoto(fallbackTerms) {
+  const url = buildAircraftPhotoFallbackUrl(fallbackTerms);
+  if (!url) return false;
+
+  const image = el('aircraftPhoto');
+  const message = el('aircraftPhotoMessage');
+  const actions = el('aircraftPhotoActions');
+
+  try {
+    const response = await fetch(url, {cache: 'no-store'});
+    const payload = await response.json();
+    if (!response.ok) return false;
+
+    const result = payload.result || {};
+    if (!result.found || !result.image_url) return false;
+
+    return await new Promise(resolve => {
+      image.onload = () => {
+        // AIRCRAFT_PHOTO_HIDE_SPINNER_AFTER_FALLBACK_LOAD_PATCH_V1
+        message.classList.remove('aircraft-photo-loading');
+        message.textContent = '';
+        message.style.display = 'none';
+        image.style.display = 'block';
+        actions.replaceChildren();
+        if (result.page_url) {
+          actions.appendChild(createDetailLink(`Open ${result.source || 'Photo Source'}`, result.page_url));
+        }
+        setNativeAircraftFallbackCredit(result);
+        resolve(true);
+      };
+      image.onerror = () => {
+        message.classList.remove('aircraft-photo-loading');
+        image.style.display = 'none';
+        image.removeAttribute('src');
+        resolve(false);
+      };
+      image.referrerPolicy = 'no-referrer';
+      image.decoding = 'async';
+      image.src = result.image_url;
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
+function makeAircraftPhotoFallbackTerms(values) {
+  const input = values || {};
+  return {
+    reg: input.reg || input.registration || '',
+    callsign: input.callsign || input.flight || '',
+    hex: input.hex || '',
+    manufacturer: input.manufacturer || input.make || '',
+    model: input.model || '',
+    type: input.type || input.aircraft_type || '',
+    operator: input.operator || input.airline || ''
+  };
+}
+
+// /AIRCRAFT_PHOTO_NATIVE_RENDER_FALLBACK_PATCH_V1
+
+function setAircraftPhotoCandidates(urls, description, fallbackTerms = null) {
   const image = el('aircraftPhoto');
   const message = el('aircraftPhotoMessage');
   const actions = el('aircraftPhotoActions');
@@ -1228,24 +1389,52 @@ function setAircraftPhotoCandidates(urls, description) {
   ));
 
   actions.replaceChildren();
+  clearNativeAircraftFallbackCredit();
   image.style.display = 'none';
   image.removeAttribute('src');
   image.referrerPolicy = 'no-referrer';
   image.decoding = 'async';
+  message.classList.remove('aircraft-photo-loading');
   message.style.display = 'block';
-  message.textContent = description || 'No photograph available for this aircraft.';
+  if (fallbackTerms || candidates.length) {
+    setAircraftPhotoLoading(message, 'Looking up aircraft photo…');
+  } else {
+    setAircraftPhotoFinalMessage(message, description || 'No photograph available for this aircraft.');
+  }
 
-  if (!candidates.length) return;
+  if (!candidates.length) {
+    if (fallbackTerms) {
+      setAircraftPhotoLoading(message, 'Looking up aircraft photo…');
+      loadNativeAircraftFallbackPhoto(fallbackTerms).then(found => {
+        if (!found) setAircraftPhotoFinalMessage(message, description || 'No photograph available for this aircraft.');
+      });
+    } else {
+      setAircraftPhotoFinalMessage(message, description || 'No photograph available for this aircraft.');
+    }
+    return;
+  }
 
   let index = 0;
   const tryNext = () => {
     if (index >= candidates.length) {
-      message.textContent = 'Embedded photograph could not be loaded. Open the available photo source below.';
+      if (fallbackTerms) {
+        setAircraftPhotoLoading(message, 'Looking up fallback aircraft photo…');
+        loadNativeAircraftFallbackPhoto(fallbackTerms).then(found => {
+          if (!found) {
+            setAircraftPhotoFinalMessage(message, 'Embedded photograph could not be loaded. Open the available photo source below.');
+            actions.appendChild(createDetailLink('Open Aircraft Photograph', candidates[0]));
+          }
+        });
+        return;
+      }
+      setAircraftPhotoFinalMessage(message, 'Embedded photograph could not be loaded. Open the available photo source below.');
       actions.appendChild(createDetailLink('Open Aircraft Photograph', candidates[0]));
       return;
     }
     const candidate = candidates[index++];
+    setAircraftPhotoLoading(message, 'Loading aircraft photograph…');
     image.onload = () => {
+      message.classList.remove('aircraft-photo-loading');
       message.style.display = 'none';
       image.style.display = 'block';
       actions.replaceChildren(createDetailLink('Open Full Photograph', candidates[candidates.length - 1]));
@@ -1347,7 +1536,16 @@ async function showAircraftDetails(aircraft) {
       updateTailNumberActions(registration);
       setAircraftPhotoCandidates(
         [enrichedAircraft.url_photo_thumbnail, enrichedAircraft.url_photo],
-        'No photograph available for this aircraft.'
+        'No photograph available for this aircraft.',
+        makeAircraftPhotoFallbackTerms({
+          reg: registration || broadcastTail,
+          callsign: flight,
+          hex: rawHex,
+          manufacturer: enrichedAircraft.manufacturer,
+          model: enrichedAircraft.type || enrichedAircraft.icao_type,
+          type: enrichedAircraft.type || enrichedAircraft.icao_type,
+          operator: enrichedAircraft.registered_owner
+        })
       );
     } else {
       detailValue('detailRegistration', broadcastTail || 'Unavailable');
@@ -1355,7 +1553,15 @@ async function showAircraftDetails(aircraft) {
       detailValue('detailModel', 'Unavailable');
       detailValue('detailOperator', 'Unavailable');
       updateTailNumberActions(broadcastTail);
-      setAircraftPhotoCandidates([], 'No photograph available for this aircraft.');
+      setAircraftPhotoCandidates(
+        [],
+        'No photograph available for this aircraft.',
+        makeAircraftPhotoFallbackTerms({
+          reg: broadcastTail,
+          callsign: flight,
+          hex: rawHex
+        })
+      );
     }
 
     if (route) {
@@ -3381,407 +3587,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
 <!-- AIRCRAFT_IMAGE_FALLBACK_TRIGGER_FIX_PATCH_V1 -->
 
-<!-- AIRCRAFT_PHOTO_BEST_GUESS_UI_PATCH_V1 -->
-<style>
-  .aircraft-photo-best-guess {
-    margin-top: 8px;
-    padding: 7px;
-    border: 1px solid rgba(170, 170, 170, 0.35);
-    border-radius: 8px;
-    background: rgba(30, 90, 140, 0.12);
-    font-size: 12px;
-    line-height: 1.35;
-  }
-  .aircraft-photo-best-guess-title { font-weight: 700; margin-bottom: 4px; }
-  .aircraft-photo-best-guess img {
-    display: block;
-    max-width: 100%;
-    max-height: 260px;
-    object-fit: contain;
-    border-radius: 6px;
-    margin-top: 5px;
-  }
-  .aircraft-photo-best-guess-links { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
-  .aircraft-photo-best-guess-links a {
-    display: inline-block;
-    padding: 3px 6px;
-    border-radius: 5px;
-    border: 1px solid rgba(180, 180, 180, 0.35);
-    text-decoration: none;
-  }
-</style>
-<script>
-(function () {
-  "use strict";
-
-  if (window.__aircraftPhotoBestGuessInstalled) return;
-  window.__aircraftPhotoBestGuessInstalled = true;
-
-  const FAILURE_TEXTS = [
-    "Embedded photograph could not be loaded",
-    "No photograph available for this aircraft",
-    "No photograph available",
-    "Aircraft photograph unavailable",
-    "Photograph unavailable"
-  ];
-
-  const pendingContainers = new WeakSet();
-  let scanTimer = null;
-
-  function hasPhotoFailureText(value) {
-    const text = String(value || "").toLowerCase();
-    return FAILURE_TEXTS.some((phrase) => text.includes(phrase.toLowerCase()));
-  }
-
-  function cleanValue(value) {
-    return String(value || "").replace(/\s+/g, " ").replace(/^[-—: ]+|[-—: ]+$/g, "").trim();
-  }
-
-  function valueFromDetailLabel(container, labels) {
-    const dts = container ? Array.from(container.querySelectorAll("dt")) : [];
-    for (const dt of dts) {
-      const label = cleanValue(dt.textContent).toLowerCase();
-      if (!labels.some((needle) => label.includes(needle))) continue;
-      const dd = dt.nextElementSibling;
-      const value = cleanValue(dd ? dd.textContent : "");
-      if (value && value !== "—" && value.toLowerCase() !== "not broadcast") return value;
-    }
-    return "";
-  }
-
-  function textFromId(id) {
-    const element = document.getElementById(id);
-    const value = cleanValue(element ? element.textContent : "");
-    if (!value || value === "—" || value.toLowerCase() === "not broadcast") return "";
-    return value;
-  }
-
-  function collectTerms(container) {
-    const text = cleanValue(container ? container.textContent : "");
-    const reg = textFromId("detailTail") || textFromId("detailRegistration") || textFromId("detailReg") || valueFromDetailLabel(container, ["tail", "registration"]);
-    const callsign = textFromId("detailFlight") || textFromId("detailCallsign") || valueFromDetailLabel(container, ["callsign", "flight"]);
-    const hex = textFromId("detailHex") || textFromId("detailIcaoHex") || valueFromDetailLabel(container, ["icao", "hex"]) || ((text.match(/\b[0-9A-F]{6}\b/i) || [])[0] || "").toUpperCase();
-    const type = textFromId("detailType") || textFromId("detailAircraftType") || valueFromDetailLabel(container, ["type"]);
-    const model = textFromId("detailModel") || textFromId("detailAircraft") || valueFromDetailLabel(container, ["model", "aircraft"]);
-    const operator = textFromId("detailOperator") || textFromId("detailAirline") || valueFromDetailLabel(container, ["operator", "airline"]);
-    return {reg, callsign, hex, type, model, operator};
-  }
-
-  function buildFallbackUrl(terms) {
-    const params = new URLSearchParams();
-    for (const [key, value] of Object.entries(terms)) {
-      if (value) params.set(key, value);
-    }
-    return `/api/aircraft/photo/fallback?${params.toString()}`;
-  }
-
-  function searchQuery(terms) {
-    return Object.values(terms).filter(Boolean).join(" ") || "aircraft";
-  }
-
-  function makeLink(label, url) {
-    const link = document.createElement("a");
-    link.textContent = label;
-    link.href = url;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    return link;
-  }
-
-  function ensureBox(container, terms) {
-    let box = container.querySelector(".aircraft-photo-best-guess");
-    if (box) return box;
-
-    // Remove old duplicate link fallback boxes from previous iterations.
-    container.querySelectorAll(".aircraft-image-fallback-lookup").forEach((node) => node.remove());
-
-    box = document.createElement("div");
-    box.className = "aircraft-photo-best-guess";
-    box.dataset.aircraftPhotoFallback = "1";
-
-    const title = document.createElement("div");
-    title.className = "aircraft-photo-best-guess-title";
-    title.textContent = "Best-guess aircraft image lookup…";
-    box.appendChild(title);
-
-    const status = document.createElement("div");
-    status.className = "aircraft-photo-best-guess-status";
-    status.textContent = "Searching JetPhotos / Planespotters…";
-    box.appendChild(status);
-
-    const links = document.createElement("div");
-    links.className = "aircraft-photo-best-guess-links";
-    const query = encodeURIComponent(`${searchQuery(terms)} aircraft photo`);
-    const primary = encodeURIComponent(terms.reg || terms.callsign || terms.hex || searchQuery(terms));
-    links.appendChild(makeLink("JetPhotos", `https://www.jetphotos.com/photo/keyword/${primary}`));
-    links.appendChild(makeLink("Planespotters", `https://www.planespotters.net/search?q=${primary}`));
-    links.appendChild(makeLink("Google Images", `https://www.google.com/search?tbm=isch&q=${query}`));
-    box.appendChild(links);
-
-    const failureNode = Array.from(container.querySelectorAll("*")).find((node) => hasPhotoFailureText(node.textContent || ""));
-    if (failureNode && failureNode.parentNode) {
-      failureNode.parentNode.appendChild(box);
-    } else {
-      container.appendChild(box);
-    }
-    return box;
-  }
-
-  async function addBestGuessImage(container) {
-    if (!container || pendingContainers.has(container)) return;
-    if (container.querySelector(".aircraft-photo-best-guess")) return;
-    if (!hasPhotoFailureText(container.textContent || "")) return;
-
-    pendingContainers.add(container);
-    const terms = collectTerms(container);
-    const box = ensureBox(container, terms);
-    const status = box.querySelector(".aircraft-photo-best-guess-status");
-
-    try {
-      const response = await fetch(buildFallbackUrl(terms), {cache: "no-store"});
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-      const result = payload.result || {};
-
-      if (!result.found || !result.image_url) {
-        status.textContent = result.message || "No fallback image found. Use the search links below.";
-        return;
-      }
-
-      status.textContent = `Best guess from ${result.source}${result.cached ? " (cached)" : ""}`;
-      const image = document.createElement("img");
-      image.alt = `Best guess aircraft photo ${searchQuery(terms)}`;
-      image.referrerPolicy = "no-referrer";
-      image.loading = "lazy";
-      image.src = result.image_url;
-      image.onerror = () => {
-        image.remove();
-        status.textContent = "Fallback image could not be embedded. Use the source links below.";
-      };
-
-      const existingImage = box.querySelector("img");
-      if (existingImage) existingImage.remove();
-      box.insertBefore(image, box.querySelector(".aircraft-photo-best-guess-links"));
-
-      if (result.page_url) {
-        const links = box.querySelector(".aircraft-photo-best-guess-links");
-        links.insertBefore(makeLink(`Open ${result.source}`, result.page_url), links.firstChild);
-      }
-    } catch (error) {
-      status.textContent = `Fallback image lookup failed: ${error.message}`;
-    }
-  }
-
-  function scanForPhotoFailures() {
-    const selectors = [".leaflet-popup-content", "[id*='detail' i]", "[class*='detail' i]", "[id*='aircraft' i]", "[class*='aircraft' i]"];
-    const seen = new Set();
-    for (const selector of selectors) {
-      let nodes = [];
-      try { nodes = Array.from(document.querySelectorAll(selector)); } catch (_error) {}
-      for (const node of nodes) {
-        if (!node || seen.has(node)) continue;
-        seen.add(node);
-        if (hasPhotoFailureText(node.textContent || "")) addBestGuessImage(node);
-      }
-    }
-  }
-
-  function scheduleScan() {
-    if (scanTimer) window.clearTimeout(scanTimer);
-    scanTimer = window.setTimeout(scanForPhotoFailures, 250);
-  }
-
-  function init() {
-    scanForPhotoFailures();
-    const observer = new MutationObserver(scheduleScan);
-    observer.observe(document.body, {childList: true, subtree: true, characterData: true});
-  }
-
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", init);
-  } else {
-    init();
-  }
-})();
-</script>
-<!-- /AIRCRAFT_PHOTO_BEST_GUESS_UI_PATCH_V1 -->
+<!-- AIRCRAFT_PHOTO_REMOVE_ALL_APPENDED_UI_OBSERVERS_PATCH_V1: removed appended photo UI block AIRCRAFT_PHOTO_BEST_GUESS_UI_PATCH_V1. -->
 
 
-<!-- AIRCRAFT_PHOTO_BEST_GUESS_CLEAN_UI_PATCH_V1 -->
-<style>
-  /* The fallback photo area should show pictures only. */
-  .aircraft-photo-best-guess {
-    margin-top: 6px !important;
-    padding: 0 !important;
-    border: 0 !important;
-    background: transparent !important;
-  }
+<!-- AIRCRAFT_PHOTO_REMOVE_ALL_APPENDED_UI_OBSERVERS_PATCH_V1: removed appended photo UI block AIRCRAFT_PHOTO_BEST_GUESS_CLEAN_UI_PATCH_V1. -->
 
-  .aircraft-photo-best-guess-title,
-  .aircraft-photo-best-guess-status,
-  .aircraft-photo-best-guess-links,
-  .aircraft-image-fallback-lookup {
-    display: none !important;
-  }
 
-  .aircraft-photo-best-guess img {
-    display: block !important;
-    max-width: 100% !important;
-    max-height: 260px !important;
-    object-fit: contain !important;
-    border-radius: 6px !important;
-    margin: 0 auto !important;
-  }
+<!-- AIRCRAFT_PHOTO_REMOVE_ALL_APPENDED_UI_OBSERVERS_PATCH_V1: removed appended photo UI block AIRCRAFT_PHOTO_MODEL_FALLBACK_UI_PATCH_V1. -->
 
-  .aircraft-photo-best-guess-credit {
-    margin-top: 4px;
-    opacity: 0.72;
-    font-size: 11px;
-    line-height: 1.3;
-  }
-</style>
-<script>
-(function () {
-  "use strict";
+<!-- AIRCRAFT_PHOTO_REMOVE_UNSTABLE_UI_RETRY_PATCHES_V1: removed unstable AIRCRAFT_PHOTO_RETRY_AFTER_METADATA_PATCH_V1. -->
 
-  if (window.__aircraftBestGuessCleanUiInstalled) return;
-  window.__aircraftBestGuessCleanUiInstalled = true;
+<!-- AIRCRAFT_PHOTO_REMOVE_UNSTABLE_UI_RETRY_PATCHES_V1: removed unstable AIRCRAFT_PHOTO_FALLBACK_PLACEMENT_REPAIR_PATCH_V1. -->
 
-  let scanTimer = null;
 
-  function cleanText(value) {
-    return String(value || "").replace(/\s+/g, " ").trim();
-  }
-
-  function findEnrichmentNote(container) {
-    if (!container) return null;
-
-    const textNeedles = [
-      "Aircraft/photo enrichment",
-      "Route enrichment",
-      "Position data"
-    ];
-
-    const nodes = Array.from(container.querySelectorAll("div, p, small, span"));
-    return nodes.find((node) => {
-      const text = cleanText(node.textContent);
-      return textNeedles.some((needle) => text.includes(needle));
-    }) || null;
-  }
-
-  function fallbackSourceFromBox(box) {
-    if (!box) return "best guess";
-    const status = box.querySelector(".aircraft-photo-best-guess-status");
-    const text = cleanText(status ? status.textContent : "");
-    const match = text.match(/Best guess from ([^(]+)/i);
-    return match ? `best guess from ${match[1].trim()}` : "best guess";
-  }
-
-  function addCreditToBottomNote(container, sourceText) {
-    if (!container) return;
-
-    if (container.querySelector(".aircraft-photo-best-guess-credit")) {
-      const existing = container.querySelector(".aircraft-photo-best-guess-credit");
-      existing.textContent = `Photo: ${sourceText}.`;
-      return;
-    }
-
-    const note = findEnrichmentNote(container);
-    const credit = document.createElement("div");
-    credit.className = "aircraft-photo-best-guess-credit";
-    credit.textContent = `Photo: ${sourceText}.`;
-
-    if (note && note.parentNode) {
-      note.parentNode.insertBefore(credit, note.nextSibling);
-    } else {
-      container.appendChild(credit);
-    }
-  }
-
-  function removeDuplicateFallbackBoxes(container) {
-    if (!container) return;
-
-    // Remove old link-only boxes completely.
-    container.querySelectorAll(".aircraft-image-fallback-lookup").forEach((node) => node.remove());
-
-    const boxes = Array.from(container.querySelectorAll(".aircraft-photo-best-guess"));
-    if (boxes.length <= 1) return;
-
-    // Prefer the first box that actually has an image.
-    const preferred = boxes.find((box) => box.querySelector("img")) || boxes[0];
-    boxes.forEach((box) => {
-      if (box !== preferred) box.remove();
-    });
-  }
-
-  function cleanFallbackPhotoUi(container) {
-    if (!container) return;
-
-    removeDuplicateFallbackBoxes(container);
-
-    const box = container.querySelector(".aircraft-photo-best-guess");
-    if (!box) return;
-
-    const img = box.querySelector("img");
-    if (!img) return;
-
-    const sourceText = fallbackSourceFromBox(box);
-    addCreditToBottomNote(container, sourceText);
-
-    // Mark for diagnostics and future scans.
-    box.dataset.cleanedBestGuessPhoto = "1";
-  }
-
-  function scan() {
-    const selectors = [
-      ".leaflet-popup-content",
-      "[id*='detail' i]",
-      "[class*='detail' i]",
-      "[id*='aircraft' i]",
-      "[class*='aircraft' i]"
-    ];
-
-    const seen = new Set();
-    for (const selector of selectors) {
-      let nodes = [];
-      try { nodes = Array.from(document.querySelectorAll(selector)); } catch (_error) { nodes = []; }
-
-      for (const node of nodes) {
-        if (!node || seen.has(node)) continue;
-        seen.add(node);
-        if (node.querySelector && (
-          node.querySelector(".aircraft-photo-best-guess") ||
-          node.querySelector(".aircraft-image-fallback-lookup")
-        )) {
-          cleanFallbackPhotoUi(node);
-        }
-      }
-    }
-  }
-
-  function scheduleScan() {
-    if (scanTimer) window.clearTimeout(scanTimer);
-    scanTimer = window.setTimeout(scan, 150);
-  }
-
-  function init() {
-    scan();
-    const observer = new MutationObserver(scheduleScan);
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true,
-      characterData: true
-    });
-  }
-
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", init);
-  } else {
-    init();
-  }
-})();
-</script>
-<!-- /AIRCRAFT_PHOTO_BEST_GUESS_CLEAN_UI_PATCH_V1 -->
+<!-- AIRCRAFT_PHOTO_REMOVE_NATIVE_DETAIL_FALLBACK_PATCH_V1: removed unstable native photo fallback wrapper. -->
 
 </body>
 </html>
