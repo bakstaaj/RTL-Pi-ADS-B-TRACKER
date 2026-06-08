@@ -3276,5 +3276,232 @@ Handler.do_POST = _airlabs_do_post
 
 # /AIRLABS_BACKEND_ROUTE_LOOKUP_PATCH_V2
 
+
+# AIRCRAFT_PHOTO_BEST_GUESS_BACKEND_PATCH_V1
+# Best-guess aircraft photo fallback lookup.
+import html as _aircraft_photo_html
+import urllib.parse as _aircraft_photo_urlparse
+import urllib.request as _aircraft_photo_urlrequest
+
+
+AIRCRAFT_PHOTO_FALLBACK_CACHE_TTL_SECONDS = int(
+    os.environ.get("RTL_PI_AIRCRAFT_PHOTO_FALLBACK_CACHE_TTL_SECONDS", "86400")
+)
+
+
+def _aircraft_photo_settings_dir() -> Path:
+    for candidate in (globals().get("SETTINGS_DIR"), globals().get("RUNTIME_SETTINGS_DIR")):
+        if isinstance(candidate, Path):
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+
+    deploy_dir = globals().get("DEPLOY_DIR")
+    if isinstance(deploy_dir, Path):
+        settings_dir = deploy_dir / "settings"
+    else:
+        settings_dir = Path("runtime/settings")
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    return settings_dir
+
+
+AIRCRAFT_PHOTO_FALLBACK_CACHE_PATH = _aircraft_photo_settings_dir() / "aircraft_photo_fallback_cache.json"
+
+
+def _aircraft_photo_read_json(path: Path) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _aircraft_photo_write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _aircraft_photo_normalize_token(value: object) -> str:
+    text = str(value or "").strip().upper()
+    text = re.sub(r"[^A-Z0-9\- ]+", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _aircraft_photo_cache_key(query: str) -> str:
+    return hashlib.sha256(query.encode("utf-8")).hexdigest()[:20]
+
+
+def _aircraft_photo_cache_get(key: str) -> dict | None:
+    cache = _aircraft_photo_read_json(AIRCRAFT_PHOTO_FALLBACK_CACHE_PATH)
+    if not isinstance(cache, dict):
+        return None
+
+    entry = cache.get(key)
+    if not isinstance(entry, dict):
+        return None
+
+    cached_utc = int(entry.get("cached_utc") or 0)
+    if cached_utc <= 0 or int(time.time()) - cached_utc > AIRCRAFT_PHOTO_FALLBACK_CACHE_TTL_SECONDS:
+        cache.pop(key, None)
+        _aircraft_photo_write_json(AIRCRAFT_PHOTO_FALLBACK_CACHE_PATH, cache)
+        return None
+
+    result = dict(entry.get("result") or {})
+    if result:
+        result["cached"] = True
+        result["cached_utc"] = cached_utc
+        return result
+    return None
+
+
+def _aircraft_photo_cache_put(key: str, result: dict) -> None:
+    cache = _aircraft_photo_read_json(AIRCRAFT_PHOTO_FALLBACK_CACHE_PATH)
+    if not isinstance(cache, dict):
+        cache = {}
+    cache[key] = {
+        "cached_utc": int(time.time()),
+        "result": result,
+    }
+    _aircraft_photo_write_json(AIRCRAFT_PHOTO_FALLBACK_CACHE_PATH, cache)
+
+
+def _aircraft_photo_fetch_text(url: str, timeout: int = 8) -> str:
+    request = _aircraft_photo_urlrequest.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 RTL-Pi-ADS-B-Tracker aircraft photo fallback",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    with _aircraft_photo_urlrequest.urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def _aircraft_photo_absolute_url(src: str, page_url: str) -> str:
+    src = _aircraft_photo_html.unescape(str(src or "").strip())
+    if src.startswith("//"):
+        return "https:" + src
+    if src.startswith("/"):
+        parsed = _aircraft_photo_urlparse.urlparse(page_url)
+        return f"{parsed.scheme}://{parsed.netloc}{src}"
+    return src
+
+
+def _aircraft_photo_first_image_from_html(html_text: str, page_url: str, source: str) -> str | None:
+    candidates: list[str] = []
+
+    # Prefer meta og:image first if available.
+    for match in re.finditer(r'''property=["']og:image["'][^>]+content=["']([^"']+)["']''', html_text, re.I):
+        src = _aircraft_photo_absolute_url(match.group(1), page_url)
+        if any(ext in src.lower() for ext in (".jpg", ".jpeg", ".png", ".webp")):
+            candidates.append(src)
+
+    # Then common lazy image attributes.
+    for match in re.finditer(r'''(?:src|data-src|data-lazy|data-original)=["']([^"']+)["']''', html_text, re.I):
+        src = _aircraft_photo_absolute_url(match.group(1), page_url)
+        low = src.lower()
+        if not any(ext in low for ext in (".jpg", ".jpeg", ".png", ".webp")):
+            continue
+        if source == "jetphotos" and "jetphotos" not in low:
+            continue
+        if source == "planespotters" and "planespotters" not in low:
+            continue
+        if any(skip in low for skip in ("logo", "icon", "avatar", "sprite", "blank", "placeholder")):
+            continue
+        candidates.append(src)
+
+    return candidates[0] if candidates else None
+
+
+def _aircraft_photo_lookup_live(query: str, reg: str) -> dict:
+    encoded_query = _aircraft_photo_urlparse.quote(query)
+    encoded_primary = _aircraft_photo_urlparse.quote(reg or query)
+
+    attempts = [
+        {"source": "JetPhotos", "page_url": f"https://www.jetphotos.com/photo/keyword/{encoded_primary}", "parse_source": "jetphotos"},
+        {"source": "Planespotters", "page_url": f"https://www.planespotters.net/search?q={encoded_primary}", "parse_source": "planespotters"},
+        {"source": "JetPhotos", "page_url": f"https://www.jetphotos.com/photo/keyword/{encoded_query}", "parse_source": "jetphotos"},
+        {"source": "Planespotters", "page_url": f"https://www.planespotters.net/search?q={encoded_query}", "parse_source": "planespotters"},
+    ]
+
+    errors: list[str] = []
+    for attempt in attempts:
+        try:
+            html_text = _aircraft_photo_fetch_text(attempt["page_url"])
+            image_url = _aircraft_photo_first_image_from_html(html_text, attempt["page_url"], attempt["parse_source"])
+            if image_url:
+                return {
+                    "found": True,
+                    "source": attempt["source"],
+                    "page_url": attempt["page_url"],
+                    "image_url": image_url,
+                    "query": query,
+                    "cached": False,
+                    "looked_up_utc": int(time.time()),
+                }
+        except Exception as exc:
+            errors.append(f"{attempt['source']}: {exc}")
+
+    return {
+        "found": False,
+        "source": "best_guess",
+        "query": query,
+        "cached": False,
+        "looked_up_utc": int(time.time()),
+        "message": "No fallback aircraft image found.",
+        "errors": errors[-4:],
+        "search_urls": {
+            "jetphotos": f"https://www.jetphotos.com/photo/keyword/{encoded_primary}",
+            "planespotters": f"https://www.planespotters.net/search?q={encoded_primary}",
+            "google_images": f"https://www.google.com/search?tbm=isch&q={encoded_query}",
+        },
+    }
+
+
+def _aircraft_photo_fallback_payload(query_string: str) -> tuple[dict, HTTPStatus]:
+    parameters = urllib.parse.parse_qs(query_string, keep_blank_values=True)
+
+    reg = _aircraft_photo_normalize_token((parameters.get("reg") or parameters.get("tail") or [""])[0])
+    callsign = _aircraft_photo_normalize_token((parameters.get("callsign") or parameters.get("flight") or [""])[0])
+    hex_value = _aircraft_photo_normalize_token((parameters.get("hex") or parameters.get("icao") or [""])[0])
+    aircraft_type = _aircraft_photo_normalize_token((parameters.get("type") or [""])[0])
+    model = _aircraft_photo_normalize_token((parameters.get("model") or [""])[0])
+    operator = _aircraft_photo_normalize_token((parameters.get("operator") or [""])[0])
+
+    terms = [term for term in (reg, callsign, hex_value, aircraft_type, model, operator) if term]
+    if not terms:
+        return {"error": "Missing aircraft photo search terms."}, HTTPStatus.BAD_REQUEST
+
+    query = " ".join(dict.fromkeys(terms))
+    cache_key = _aircraft_photo_cache_key(query)
+
+    cached = _aircraft_photo_cache_get(cache_key)
+    if cached:
+        return {"result": cached}, HTTPStatus.OK
+
+    result = _aircraft_photo_lookup_live(query, reg or callsign or hex_value or query)
+    if result.get("found"):
+        _aircraft_photo_cache_put(cache_key, result)
+
+    return {"result": result}, HTTPStatus.OK
+
+
+_original_aircraft_photo_do_get = Handler.do_GET
+
+
+def _aircraft_photo_do_get(self) -> None:
+    request = urlparse(self.path)
+    if request.path == "/api/aircraft/photo/fallback":
+        payload, status = _aircraft_photo_fallback_payload(request.query)
+        self.send_json(payload, status)
+        return
+
+    return _original_aircraft_photo_do_get(self)
+
+
+Handler.do_GET = _aircraft_photo_do_get
+
+# /AIRCRAFT_PHOTO_BEST_GUESS_BACKEND_PATCH_V1
+
 if __name__ == "__main__":
     main()
