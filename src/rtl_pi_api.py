@@ -1547,6 +1547,48 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": "POST endpoint not found."}, HTTPStatus.NOT_FOUND)
 
     def do_GET(self) -> None:
+                # WEB_SPLIT_STATIC_ASSET_ROUTE_PATCH_V2
+        import urllib.parse as _asset_urlparse
+        import pathlib as _asset_pathlib
+
+        _asset_parsed = _asset_urlparse.urlparse(self.path)
+        if _asset_parsed.path in ("/app.css", "/app.js"):
+            _asset_name = _asset_parsed.path.lstrip("/")
+            _asset_candidates = [
+                _asset_pathlib.Path("/opt/rtl-pi-adsb-tracker/web") / _asset_name,
+                _asset_pathlib.Path(__file__).resolve().parent.parent / "web" / _asset_name,
+                _asset_pathlib.Path(__file__).resolve().parent / "web" / _asset_name,
+                _asset_pathlib.Path.cwd() / "web" / _asset_name,
+            ]
+
+            for _asset_file in _asset_candidates:
+                try:
+                    if _asset_file.exists():
+                        _asset_data = _asset_file.read_bytes()
+                        _asset_type = "text/css; charset=utf-8" if _asset_name.endswith(".css") else "application/javascript; charset=utf-8"
+                        self.send_response(HTTPStatus.OK)
+                        self.send_header("Content-Type", _asset_type)
+                        self.send_header("Content-Length", str(len(_asset_data)))
+                        self.send_header("Cache-Control", "no-cache")
+                        self.end_headers()
+                        self.wfile.write(_asset_data)
+                        return
+                except Exception as _asset_error:
+                    self.send_json({
+                        "error": "Static asset read failed",
+                        "asset": _asset_name,
+                        "path": str(_asset_file),
+                        "detail": str(_asset_error),
+                    }, HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+
+            self.send_json({
+                "error": "Static asset not found",
+                "asset": _asset_name,
+                "checked": [str(candidate) for candidate in _asset_candidates],
+            }, HTTPStatus.NOT_FOUND)
+            return
+
         request = urlparse(self.path)
         if request.path in ("/", "/index.html"):
             self.send_existing_file(WEB_ROOT / "index.html", "text/html; charset=utf-8")

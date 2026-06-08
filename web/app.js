@@ -1025,14 +1025,49 @@ function setAircraftPhotoCandidates(urls, description, fallbackTerms = null) {
   };
   tryNext();
 }
+
+// LOCAL_TAR1090_AIRCRAFT_CACHE_UI_FALLBACK_PATCH_V1
+async function fetchLocalAircraftCacheEnrichment(identifier) {
+  const hex = String(identifier || '').replace(/^~/, '').trim().toUpperCase();
+  if (!/^[0-9A-F]{6}$/.test(hex)) return null;
+
+  try {
+    const response = await jsonRequest(`/api/aircraft/local?hex=${encodeURIComponent(hex)}`);
+    if (!response || !response.found || !response.aircraft) return null;
+    return {
+      aircraft: response.aircraft,
+      flightroute: null,
+      source: response.source || 'local tar1090-db aircraft cache'
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
+// /LOCAL_TAR1090_AIRCRAFT_CACHE_UI_FALLBACK_PATCH_V1
+
 async function fetchAircraftEnrichment(identifier, callsign = '') {
   if (!identifier) return null;
-  let url = `https://api.adsbdb.com/v0/aircraft/${encodeURIComponent(identifier)}`;
-  if (callsign) url += `?callsign=${encodeURIComponent(callsign)}`;
-  const response = await fetch(url, {cache: 'no-store'});
-  if (!response.ok) return null;
-  const result = await response.json();
-  return result.response && typeof result.response === 'object' ? result.response : null;
+
+  let adsbdbPayload = null;
+  try {
+    let url = `https://api.adsbdb.com/v0/aircraft/${encodeURIComponent(identifier)}`;
+    if (callsign) url += `?callsign=${encodeURIComponent(callsign)}`;
+    const response = await fetch(url, {cache: 'no-store'});
+    if (response.ok) {
+      const result = await response.json();
+      adsbdbPayload = result.response && typeof result.response === 'object' ? result.response : null;
+    }
+  } catch (_error) {
+    adsbdbPayload = null;
+  }
+
+  if (adsbdbPayload && adsbdbPayload.aircraft) return adsbdbPayload;
+
+  const localPayload = await fetchLocalAircraftCacheEnrichment(identifier);
+  if (localPayload && localPayload.aircraft) return localPayload;
+
+  return adsbdbPayload;
 }
 async function applyAirlabsRouteToDetails(flight) {
   const callsign = String(flight || '').trim().toUpperCase();
