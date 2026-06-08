@@ -3437,6 +3437,8 @@ def _aircraft_photo_lookup_live(query: str, reg: str) -> dict:
                     "image_url": image_url,
                     "query": query,
                     "cached": False,
+                    "match_level": "exact",
+                    "representative": False,
                     "looked_up_utc": int(time.time()),
                 }
         except Exception as exc:
@@ -3447,6 +3449,8 @@ def _aircraft_photo_lookup_live(query: str, reg: str) -> dict:
         "source": "best_guess",
         "query": query,
         "cached": False,
+        "match_level": "none",
+        "representative": False,
         "looked_up_utc": int(time.time()),
         "message": "No fallback aircraft image found.",
         "errors": errors[-4:],
@@ -3456,6 +3460,48 @@ def _aircraft_photo_lookup_live(query: str, reg: str) -> dict:
             "google_images": f"https://www.google.com/search?tbm=isch&q={encoded_query}",
         },
     }
+
+
+
+def _aircraft_photo_type_query(aircraft_type: str, model: str) -> str:
+    terms: list[str] = []
+    for term in (model, aircraft_type):
+        normalized = _aircraft_photo_normalize_token(term)
+        if normalized and normalized not in terms:
+            terms.append(normalized)
+    return " ".join(terms)
+
+
+def _aircraft_photo_lookup_representative_type(aircraft_type: str, model: str) -> dict:
+    type_query = _aircraft_photo_type_query(aircraft_type, model)
+    if not type_query:
+        return {
+            "found": False,
+            "source": "type_fallback",
+            "query": "",
+            "cached": False,
+            "match_level": "none",
+            "representative": False,
+            "looked_up_utc": int(time.time()),
+            "message": "No aircraft type/model available for representative photo lookup.",
+        }
+
+    cache_key = _aircraft_photo_cache_key("type:" + type_query)
+    cached = _aircraft_photo_cache_get(cache_key)
+    if cached:
+        cached["match_level"] = cached.get("match_level") or "type"
+        cached["representative"] = True
+        return cached
+
+    result = _aircraft_photo_lookup_live(type_query, type_query)
+    result["match_level"] = "type" if result.get("found") else "none"
+    result["representative"] = bool(result.get("found"))
+    result["type_query"] = type_query
+
+    if result.get("found"):
+        _aircraft_photo_cache_put(cache_key, result)
+
+    return result
 
 
 def _aircraft_photo_fallback_payload(query_string: str) -> tuple[dict, HTTPStatus]:
@@ -3481,7 +3527,18 @@ def _aircraft_photo_fallback_payload(query_string: str) -> tuple[dict, HTTPStatu
 
     result = _aircraft_photo_lookup_live(query, reg or callsign or hex_value or query)
     if result.get("found"):
+        result["match_level"] = result.get("match_level") or "exact"
+        result["representative"] = False
         _aircraft_photo_cache_put(cache_key, result)
+        return {"result": result}, HTTPStatus.OK
+
+    # Exact aircraft lookup failed. Try a representative type/model lookup and
+    # cache it separately so future aircraft of the same type avoid repeated
+    # external photo-site lookups.
+    type_result = _aircraft_photo_lookup_representative_type(aircraft_type, model)
+    if type_result.get("found"):
+        type_result["exact_lookup_message"] = result.get("message")
+        return {"result": type_result}, HTTPStatus.OK
 
     return {"result": result}, HTTPStatus.OK
 
@@ -3501,6 +3558,9 @@ def _aircraft_photo_do_get(self) -> None:
 
 Handler.do_GET = _aircraft_photo_do_get
 
+# AIRCRAFT_PHOTO_TYPE_FALLBACK_CACHE_PATCH_V1
+# Representative make/model/type photo fallback cache enabled.
+# /AIRCRAFT_PHOTO_TYPE_FALLBACK_CACHE_PATCH_V1
 # /AIRCRAFT_PHOTO_BEST_GUESS_BACKEND_PATCH_V1
 
 if __name__ == "__main__":
