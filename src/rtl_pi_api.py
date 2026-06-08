@@ -1547,6 +1547,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": "POST endpoint not found."}, HTTPStatus.NOT_FOUND)
 
     def do_GET(self) -> None:
+        # AIRLABS_ROUTE2_IATA_VARIANTS_BACKEND_PATCH_V1 route
+        import urllib.parse as _airlabs_route2_urlparse
+        _airlabs_route2_parsed = _airlabs_route2_urlparse.urlparse(self.path)
+        if _airlabs_route2_parsed.path == "/api/diagnostics/airlabs/route2":
+            payload, status = _airlabs_route2_response(_airlabs_route2_parsed.query)
+            self.send_json(payload, status)
+            return
+
+        # LOCAL_TAR1090_AIRCRAFT_CACHE_FALLBACK_SAFE_V2 route
+        import urllib.parse as _local_tar1090_urlparse
+        _local_tar1090_parsed = _local_tar1090_urlparse.urlparse(self.path)
+        if _local_tar1090_parsed.path == "/api/aircraft/local":
+            payload, status = _local_tar1090_lookup_response(_local_tar1090_parsed.query)
+            self.send_json(payload, status)
+            return
+
                 # WEB_SPLIT_STATIC_ASSET_ROUTE_PATCH_V2
         import urllib.parse as _asset_urlparse
         import pathlib as _asset_pathlib
@@ -4664,6 +4680,385 @@ def _aircraft_photo_expand_model_terms(manufacturer: str, aircraft_type: str, mo
     return _aircraft_photo_smart_model_queries(manufacturer, aircraft_type, model)
 
 # /AIRCRAFT_PHOTO_MORE_MODEL_SYNONYMS_PATCH_V1
+
+
+# LOCAL_TAR1090_AIRCRAFT_CACHE_FALLBACK_SAFE_V2
+# Local tar1090-db aircraft.csv.gz cache fallback for ADSBDB misses.
+
+_LOCAL_TAR1090_CACHE = {
+    "path": None,
+    "mtime": None,
+    "records": None,
+}
+
+
+def _local_tar1090_candidate_paths() -> list:
+    import os as _os
+    from pathlib import Path as _Path
+
+    candidates = []
+    for env_name in ("RTL_PI_SETTINGS_DIR", "SETTINGS_DIR"):
+        env_value = _os.environ.get(env_name)
+        if env_value:
+            candidates.append(_Path(env_value) / "aircraft_hex_db.json")
+
+    here = _Path(__file__).resolve()
+    candidates.extend([
+        _Path("/opt/rtl-pi-adsb-tracker/settings/aircraft_hex_db.json"),
+        here.parent.parent / "settings" / "aircraft_hex_db.json",
+        here.parent / "settings" / "aircraft_hex_db.json",
+        _Path("runtime/settings/aircraft_hex_db.json"),
+        _Path("settings/aircraft_hex_db.json"),
+    ])
+
+    unique = []
+    seen = set()
+    for path in candidates:
+        key = str(path)
+        if key not in seen:
+            unique.append(path)
+            seen.add(key)
+    return unique
+
+
+_LOCAL_TAR1090_CACHE = {"path": None, "mtime": None, "records": None}
+
+
+def _local_tar1090_norm_hex(value: str) -> str:
+    return str(value or "").strip().upper().replace("~", "")
+
+
+def _local_tar1090_load_records() -> tuple[dict, str | None]:
+    import json as _json
+
+    for path in _local_tar1090_candidate_paths():
+        try:
+            if not path.exists():
+                continue
+            mtime = path.stat().st_mtime
+            if (
+                _LOCAL_TAR1090_CACHE.get("records") is not None
+                and _LOCAL_TAR1090_CACHE.get("path") == str(path)
+                and _LOCAL_TAR1090_CACHE.get("mtime") == mtime
+            ):
+                return _LOCAL_TAR1090_CACHE["records"], str(path)
+
+            with path.open("r", encoding="utf-8") as handle:
+                payload = _json.load(handle)
+
+            records = {}
+            if isinstance(payload, dict) and isinstance(payload.get("records"), dict):
+                for key, record in payload["records"].items():
+                    hex_key = _local_tar1090_norm_hex(key)
+                    if hex_key:
+                        records[hex_key] = record
+            elif isinstance(payload, dict) and isinstance(payload.get("aircraft"), list):
+                for record in payload["aircraft"]:
+                    if isinstance(record, dict):
+                        hex_key = _local_tar1090_norm_hex(record.get("hex") or record.get("icao") or record.get("icao_hex") or record.get("mode_s"))
+                        if hex_key:
+                            records[hex_key] = record
+            elif isinstance(payload, dict):
+                for key, record in payload.items():
+                    hex_key = _local_tar1090_norm_hex(key)
+                    if hex_key:
+                        records[hex_key] = record
+            elif isinstance(payload, list):
+                for record in payload:
+                    if isinstance(record, dict):
+                        hex_key = _local_tar1090_norm_hex(record.get("hex") or record.get("icao") or record.get("icao_hex") or record.get("mode_s"))
+                        if hex_key:
+                            records[hex_key] = record
+
+            _LOCAL_TAR1090_CACHE.update({"path": str(path), "mtime": mtime, "records": records})
+            return records, str(path)
+        except Exception:
+            continue
+
+    _LOCAL_TAR1090_CACHE.update({"path": None, "mtime": None, "records": {}})
+    return {}, None
+
+
+def _local_tar1090_value(record, *names):
+    if isinstance(record, dict):
+        for name in names:
+            if name in record and record[name] not in ("", None):
+                return record[name]
+    elif isinstance(record, list):
+        index_by_name = {
+            "registration": 1, "reg": 1,
+            "type": 2, "icao_type": 2,
+            "operator": 3, "owner": 3, "registered_owner": 3,
+            "description": 4, "desc": 4,
+        }
+        for name in names:
+            index = index_by_name.get(name)
+            if index is not None and len(record) > index and record[index] not in ("", None):
+                return record[index]
+    elif isinstance(record, str):
+        return record
+    return ""
+
+
+def _local_tar1090_manufacturer_from_desc(description: str, icao_type: str) -> str:
+    text = str(description or "").strip()
+    if not text:
+        return ""
+
+    upper = text.upper()
+    known = [
+        "AIRBUS", "BOEING", "EMBRAER", "BOMBARDIER", "CANADAIR",
+        "CESSNA", "PIPER", "BEECH", "BEECHCRAFT", "GULFSTREAM",
+        "DASSAULT", "MCDONNELL DOUGLAS", "ROBINSON", "SIKORSKY",
+        "LEARJET", "DIAMOND", "CIRRUS",
+    ]
+    for maker in known:
+        if upper.startswith(maker):
+            return maker.title() if maker != "MCDONNELL DOUGLAS" else "McDonnell Douglas"
+
+    first = text.split()[0] if text.split() else ""
+    if first and first.upper() != str(icao_type or "").upper():
+        return first.title()
+    return ""
+
+
+def _local_tar1090_record_to_aircraft(hex_value: str, record) -> dict:
+    registration = _local_tar1090_value(record, "registration", "reg", "r", "tail", "n_number", "nnumber")
+    icao_type = _local_tar1090_value(record, "icao_type", "type", "t", "icaoType", "icao_type_code")
+    description = _local_tar1090_value(record, "description", "desc", "model", "aircraft", "aircraft_type", "long_type")
+    operator = _local_tar1090_value(record, "registered_owner", "owner", "operator", "ownop", "op", "o", "airline")
+    manufacturer = _local_tar1090_value(record, "manufacturer", "make", "mfr", "builder") or _local_tar1090_manufacturer_from_desc(description, icao_type)
+
+    return {
+        "hex": hex_value,
+        "registration": str(registration or "").strip(),
+        "manufacturer": str(manufacturer or "").strip(),
+        "type": str((description or icao_type or "")).strip(),
+        "icao_type": str(icao_type or "").strip(),
+        "registered_owner": str(operator or "").strip(),
+        "source": "local tar1090-db aircraft cache",
+    }
+
+
+def _local_tar1090_lookup_response(query_string: str) -> tuple[dict, HTTPStatus]:
+    import re as _re
+    import urllib.parse as _urlparse
+
+    params = _urlparse.parse_qs(query_string, keep_blank_values=True)
+    hex_value = _local_tar1090_norm_hex((params.get("hex") or params.get("icao") or params.get("icao_hex") or [""])[0])
+
+    if not _re.fullmatch(r"[0-9A-F]{6}", hex_value or ""):
+        return {"error": "A 6-character ICAO hex is required."}, HTTPStatus.BAD_REQUEST
+
+    records, cache_path = _local_tar1090_load_records()
+    record = records.get(hex_value)
+
+    if not record:
+        return {
+            "found": False,
+            "hex": hex_value,
+            "source": "local tar1090-db aircraft cache",
+            "cache_path": cache_path,
+            "cache_count": len(records),
+            "message": "Aircraft not found in local tar1090-db cache.",
+        }, HTTPStatus.OK
+
+    return {
+        "found": True,
+        "hex": hex_value,
+        "aircraft": _local_tar1090_record_to_aircraft(hex_value, record),
+        "flightroute": None,
+        "source": "local tar1090-db aircraft cache",
+        "cache_path": cache_path,
+        "cache_count": len(records),
+    }, HTTPStatus.OK
+
+# /LOCAL_TAR1090_AIRCRAFT_CACHE_FALLBACK_SAFE_V2
+
+
+# AIRLABS_ROUTE2_IATA_VARIANTS_BACKEND_PATCH_V1
+# Alternate AirLabs route endpoint with flight_icao and flight_iata support.
+
+def _airlabs_route2_get_api_key() -> str:
+    import os as _os
+    import json as _json
+    from pathlib import Path as _Path
+
+    for env_name in ("AIRLABS_API_KEY", "AIRLABS_KEY"):
+        value = _os.environ.get(env_name)
+        if value:
+            return str(value).strip()
+
+    candidates = []
+    settings_dir = _os.environ.get("RTL_PI_SETTINGS_DIR") or _os.environ.get("SETTINGS_DIR")
+    if settings_dir:
+        candidates.append(_Path(settings_dir) / "airlabs.json")
+        candidates.append(_Path(settings_dir) / "airlabs_settings.json")
+
+    here = _Path(__file__).resolve()
+    candidates.extend([
+        _Path("/opt/rtl-pi-adsb-tracker/settings/airlabs.json"),
+        _Path("/opt/rtl-pi-adsb-tracker/settings/airlabs_settings.json"),
+        here.parent.parent / "settings" / "airlabs.json",
+        here.parent.parent / "settings" / "airlabs_settings.json",
+        here.parent / "settings" / "airlabs.json",
+        here.parent / "settings" / "airlabs_settings.json",
+        _Path("settings/airlabs.json"),
+        _Path("settings/airlabs_settings.json"),
+    ])
+
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8").strip()
+            if not text:
+                continue
+            if text.startswith("{"):
+                payload = _json.loads(text)
+                for key_name in ("api_key", "key", "airlabs_api_key", "AIRLABS_API_KEY"):
+                    if payload.get(key_name):
+                        return str(payload[key_name]).strip()
+            else:
+                return text.strip()
+        except Exception:
+            continue
+
+    for helper_name in ("_airlabs_get_api_key", "_get_airlabs_api_key", "get_airlabs_api_key", "_load_airlabs_api_key"):
+        helper = globals().get(helper_name)
+        if callable(helper):
+            try:
+                value = helper()
+                if value:
+                    return str(value).strip()
+            except Exception:
+                pass
+
+    return ""
+
+
+_AIRLABS_ROUTE2_CACHE = {}
+
+
+def _airlabs_route2_cache_key(kind: str, flight: str) -> str:
+    return f"{kind}:{str(flight or '').strip().upper()}"
+
+
+def _airlabs_route2_extract_route(item: dict, requested_kind: str, requested_flight: str) -> dict:
+    import time as _time
+
+    dep_iata = item.get("dep_iata") or item.get("departure_iata")
+    dep_icao = item.get("dep_icao") or item.get("departure_icao")
+    arr_iata = item.get("arr_iata") or item.get("arrival_iata")
+    arr_icao = item.get("arr_icao") or item.get("arrival_icao")
+
+    return {
+        "found": bool(dep_iata or dep_icao or arr_iata or arr_icao),
+        "from": dep_iata or dep_icao or "Route unavailable",
+        "to": arr_iata or arr_icao or "Route unavailable",
+        "dep_iata": dep_iata,
+        "dep_icao": dep_icao,
+        "dep_name": item.get("dep_name") or item.get("departure_name"),
+        "arr_iata": arr_iata,
+        "arr_icao": arr_icao,
+        "arr_name": item.get("arr_name") or item.get("arrival_name"),
+        "airline_iata": item.get("airline_iata"),
+        "airline_icao": item.get("airline_icao"),
+        "flight_iata": item.get("flight_iata"),
+        "flight_icao": item.get("flight_icao"),
+        "source": "airlabs",
+        "cached": False,
+        "looked_up_utc": int(_time.time()),
+        "raw": item,
+        f"{requested_kind}_requested": requested_flight,
+    }
+
+
+def _airlabs_route2_lookup(kind: str, flight: str) -> dict:
+    import json as _json
+    import time as _time
+    import urllib.parse as _urlparse
+    import urllib.request as _urlrequest
+
+    kind = "flight_iata" if kind == "flight_iata" else "flight_icao"
+    flight = str(flight or "").strip().upper()
+
+    if not flight:
+        return {"found": False, kind: flight, "source": "airlabs", "message": "Missing flight identifier."}
+
+    cache_key = _airlabs_route2_cache_key(kind, flight)
+    now = int(_time.time())
+    cached = _AIRLABS_ROUTE2_CACHE.get(cache_key)
+    if cached and now - int(cached.get("cached_utc", 0)) < 7200:
+        route = dict(cached)
+        route["cached"] = True
+        return route
+
+    api_key = _airlabs_route2_get_api_key()
+    if not api_key:
+        return {"found": False, kind: flight, "source": "airlabs", "message": "AirLabs is not configured."}
+
+    url = "https://airlabs.co/api/v9/flights?" + _urlparse.urlencode({"api_key": api_key, kind: flight})
+
+    try:
+        request = _urlrequest.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "RTL-Pi-ADS-B-Tracker/airlabs-route2",
+            },
+        )
+        with _urlrequest.urlopen(request, timeout=8) as response:
+            payload = _json.loads(response.read().decode("utf-8", "replace"))
+    except Exception as exc:
+        return {"found": False, kind: flight, "source": "airlabs", "message": f"AirLabs lookup failed: {exc}"}
+
+    response_items = payload.get("response")
+    if isinstance(response_items, dict):
+        response_items = [response_items]
+    if not isinstance(response_items, list):
+        response_items = []
+
+    for item in response_items:
+        if not isinstance(item, dict):
+            continue
+        returned = str(item.get(kind) or "").strip().upper()
+        if returned and returned != flight:
+            continue
+        route = _airlabs_route2_extract_route(item, kind, flight)
+        if route.get("found"):
+            route["cached_utc"] = now
+            _AIRLABS_ROUTE2_CACHE[cache_key] = dict(route)
+            return route
+
+    return {
+        "found": False,
+        kind: flight,
+        "source": "airlabs",
+        "cached": False,
+        "looked_up_utc": now,
+        "message": "AirLabs returned no matching flights.",
+    }
+
+
+def _airlabs_route2_response(query_string: str) -> tuple[dict, HTTPStatus]:
+    import urllib.parse as _urlparse
+
+    params = _urlparse.parse_qs(query_string, keep_blank_values=True)
+    flight_iata = str((params.get("flight_iata") or [""])[0]).strip().upper()
+    flight_icao = str((params.get("flight_icao") or params.get("callsign") or [""])[0]).strip().upper()
+
+    if flight_iata:
+        route = _airlabs_route2_lookup("flight_iata", flight_iata)
+        return {"flight_iata": flight_iata, "route": route, "cached": bool(route.get("cached"))}, HTTPStatus.OK
+
+    if flight_icao:
+        route = _airlabs_route2_lookup("flight_icao", flight_icao)
+        return {"flight_icao": flight_icao, "route": route, "cached": bool(route.get("cached"))}, HTTPStatus.OK
+
+    return {"error": "Missing flight_icao, callsign, or flight_iata parameter."}, HTTPStatus.BAD_REQUEST
+
+# /AIRLABS_ROUTE2_IATA_VARIANTS_BACKEND_PATCH_V1
 
 if __name__ == "__main__":
     main()

@@ -169,6 +169,182 @@ async function jsonRequest(url, options) {
   return result;
 }
 
+// AIRLABS_ROUTE2_IATA_VARIANTS_UI_PATCH_V1
+
+// PRIVATE_CHARTER_ROUTE_SOURCE_PATCH_V1
+const PRIVATE_CHARTER_CALLSIGN_PREFIXES = {
+  KOW: 'Baker Aviation / Rodeo',
+  LYM: 'Key Lime Air',
+  LXJ: 'Flexjet',
+  EJA: 'NetJets',
+  NJE: 'NetJets Europe',
+  XOJ: 'XOJET',
+  FTH: 'Mountain Aviation',
+  GAJ: 'Wheels Up',
+  WUP: 'Wheels Up',
+  DPJ: 'Delta Private Jets',
+  JTL: 'Jet Linx',
+  PEG: 'Pegasus Elite Aviation',
+  TWY: 'Solairus Aviation',
+  XSR: 'Executive Flight Services',
+  OPT: 'Flight Options'
+};
+
+function callsignPrefix(callsign) {
+  const match = String(callsign || '').trim().toUpperCase().match(/^([A-Z]{2,4})/);
+  return match ? match[1] : '';
+}
+
+function privateCharterOperatorForCallsign(callsign) {
+  const prefix = callsignPrefix(callsign);
+  return PRIVATE_CHARTER_CALLSIGN_PREFIXES[prefix] || '';
+}
+
+
+// TAIL_NUMBER_ROUTE_SOURCE_PATCH_V1
+function isTailNumberCallsign(callsign) {
+  const value = String(callsign || '').trim().toUpperCase().replace(/\s+/g, '');
+  if (!value) return false;
+
+  // United States N-numbers: N + 1-5 digits with optional one/two trailing letters.
+  if (/^N[0-9]{1,5}[A-Z]{0,2}$/.test(value)) return true;
+
+  // Conservative non-US civil registration patterns sometimes seen as ADS-B callsigns.
+  if (/^C-[FGI][A-Z]{3}$/.test(value)) return true;
+  if (/^G-[A-Z]{4}$/.test(value)) return true;
+  if (/^D-[A-Z]{4}$/.test(value)) return true;
+  if (/^F-[A-Z]{4}$/.test(value)) return true;
+  if (/^VH-[A-Z]{3}$/.test(value)) return true;
+  if (/^ZK-[A-Z]{3}$/.test(value)) return true;
+  if (/^JA[0-9]{4}[A-Z]{0,2}$/.test(value)) return true;
+  if (/^HL[0-9]{4}$/.test(value)) return true;
+
+  return false;
+}
+
+function tailNumberRouteSourceMessage(callsign) {
+  const value = String(callsign || '').trim().toUpperCase().replace(/\s+/g, '');
+  if (value) {
+    return `Private/general aviation tail-number callsign - ${value}; route not available from AirLabs`;
+  }
+  return 'Private/general aviation tail-number callsign - route not available from AirLabs';
+}
+
+// /TAIL_NUMBER_ROUTE_SOURCE_PATCH_V1
+
+function routeNoMatchSourceMessage(callsign) {
+  if (isTailNumberCallsign(callsign)) {
+    return tailNumberRouteSourceMessage(callsign);
+  }
+
+  const operator = privateCharterOperatorForCallsign(callsign);
+  if (operator) {
+    return `Private/charter callsign - ${operator}; route not available from AirLabs`;
+  }
+
+  return 'AirLabs - no route match';
+}
+
+// /PRIVATE_CHARTER_ROUTE_SOURCE_PATCH_V1
+
+const AIRLABS_ICAO_TO_IATA = {
+  AAL: 'AA',
+  ACA: 'AC',
+  AFR: 'AF',
+  ASA: 'AS',
+  BAW: 'BA',
+  CPA: 'CX',
+  DAL: 'DL',
+  DLH: 'LH',
+  FFT: 'F9',
+  JAL: 'JL',
+  JBU: 'B6',
+  KAL: 'KE',
+  KLM: 'KL',
+  LYM: 'KG',
+  NKS: 'NK',
+  QTR: 'QR',
+  SWA: 'WN',
+  THY: 'TK',
+  UAE: 'EK',
+  UAL: 'UA',
+  VOI: 'Y4'
+};
+
+function airlabsFlightRouteCandidates(callsign) {
+  const raw = String(callsign || '').trim().toUpperCase().replace(/\s+/g, '');
+  if (!raw) return [];
+
+  const candidates = [];
+  const add = (kind, flight, source) => {
+    const value = String(flight || '').trim().toUpperCase();
+    if (!value) return;
+    const key = `${kind}:${value}`;
+    if (!candidates.some(candidate => candidate.key === key)) {
+      candidates.push({kind, flight: value, source, key});
+    }
+  };
+
+  add('flight_icao', raw, 'original');
+
+  const match = raw.match(/^([A-Z]{2,4})([0-9]{1,5}[A-Z]?)$/);
+  if (!match) return candidates;
+
+  const icaoPrefix = match[1];
+  const suffix = match[2];
+  const suffixMatch = suffix.match(/^0*([0-9]+)([A-Z]?)$/);
+  if (!suffixMatch) return candidates;
+
+  const normalizedNumber = String(parseInt(suffixMatch[1], 10)) + (suffixMatch[2] || '');
+  const normalizedIcao = `${icaoPrefix}${normalizedNumber}`;
+  if (normalizedIcao !== raw) add('flight_icao', normalizedIcao, 'normalized_icao');
+
+  const iataPrefix = AIRLABS_ICAO_TO_IATA[icaoPrefix];
+  if (iataPrefix) {
+    add('flight_iata', `${iataPrefix}${suffix}`, 'iata');
+    add('flight_iata', `${iataPrefix}${normalizedNumber}`, 'normalized_iata');
+  }
+
+  return candidates;
+}
+
+async function fetchAirLabsRouteWithVariants(callsign) {
+  const candidates = airlabsFlightRouteCandidates(callsign);
+  let firstResponse = null;
+
+  for (const candidate of candidates) {
+    try {
+      const parameter = candidate.kind === 'flight_iata' ? 'flight_iata' : 'flight_icao';
+      const response = await jsonRequest(`/api/diagnostics/airlabs/route2?${parameter}=${encodeURIComponent(candidate.flight)}`);
+      if (!firstResponse) firstResponse = response;
+
+      if (response && response.route && response.route.found) {
+        if (candidate.flight !== String(callsign || '').trim().toUpperCase()) {
+          response.route.flight_original = String(callsign || '').trim().toUpperCase();
+          response.route.flight_lookup_used = candidate.flight;
+          response.route.flight_lookup_kind = candidate.kind;
+          response.route.flight_lookup_source = candidate.source;
+        }
+        return response;
+      }
+    } catch (_error) {
+      // Try the next candidate.
+    }
+  }
+
+  return firstResponse || {
+    route: {
+      found: false,
+      flight_icao: String(callsign || '').trim().toUpperCase(),
+      source: 'airlabs',
+      message: 'AirLabs returned no matching flights.'
+    }
+  };
+}
+
+// /AIRLABS_ROUTE2_IATA_VARIANTS_UI_PATCH_V1
+
+
 function altitudeFeet(aircraft) {
   const value = aircraft.alt_baro != null ? aircraft.alt_baro : aircraft.alt_geom;
   const parsed = Number(value);
@@ -633,8 +809,69 @@ function changeTrailRetention() {
     'good');
 }
 
+
+  // AIRCRAFT_MAP_DBLCLICK_CAPTURE_DETAILS_PATCH_V6
+  function ensureAircraftMapDoubleClickDetailsHandler() {
+    if (!aircraftMap) return;
+
+    if (aircraftMap.doubleClickZoom) {
+      aircraftMap.doubleClickZoom.disable();
+    }
+
+    if (aircraftMap.__aircraftDetailsDblClickCaptureV6) return;
+
+    const container = aircraftMap.getContainer ? aircraftMap.getContainer() : null;
+    if (!container) return;
+
+    container.addEventListener('dblclick', event => {
+      const target = event.target;
+      const icon = target && target.closest ? target.closest('.leaflet-marker-icon') : null;
+      if (!icon || !icon.__aircraftDetailsMarkerV6) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+
+      if (aircraftMap.doubleClickZoom) {
+        aircraftMap.doubleClickZoom.disable();
+      }
+
+      const marker = icon.__aircraftDetailsMarkerV6;
+      const aircraft = marker && marker.__aircraftDetailsRecordV6;
+      if (aircraft) {
+        showAircraftDetails(aircraft);
+      }
+    }, true);
+
+    aircraftMap.__aircraftDetailsDblClickCaptureV6 = true;
+  }
+
+  function attachAircraftMarkerDetailsRecord(marker, aircraft) {
+    if (!marker || !aircraft) return;
+
+    marker.__aircraftDetailsRecordV6 = aircraft;
+
+    const attachIcon = () => {
+      const icon = marker.getElement ? marker.getElement() : marker._icon;
+      if (!icon) return;
+      icon.__aircraftDetailsMarkerV6 = marker;
+      icon.title = icon.title || 'Double-click for aircraft details';
+    };
+
+    attachIcon();
+
+    if (typeof marker.on === 'function' && !marker.__aircraftDetailsAddHookV6) {
+      marker.on('add', attachIcon);
+      marker.__aircraftDetailsAddHookV6 = true;
+    }
+
+    window.setTimeout(attachIcon, 0);
+  }
+  // /AIRCRAFT_MAP_DBLCLICK_CAPTURE_DETAILS_PATCH_V6
+
 function updateAircraftMap(aircraftRecords) {
   if (!aircraftMap) return;
+    ensureAircraftMapDoubleClickDetailsHandler();
   const positioned = aircraftRecords.filter(item => Number.isFinite(Number(item.lat)) && Number.isFinite(Number(item.lon)));
   const visibleIds = new Set();
 
@@ -653,12 +890,15 @@ function updateAircraftMap(aircraftRecords) {
         keyboard: false,
         riseOnHover: true
       }).addTo(aircraftMap);
+
+      
       aircraftMapMarkers.set(key, marker);
     } else {
       marker.setLatLng(point);
       marker.setIcon(aircraftMapIcon(aircraft));
     }
     marker.bindPopup(aircraftPopup(aircraft));
+      attachAircraftMarkerDetailsRecord(marker, aircraft);
   }
 
   for (const [key, marker] of aircraftMapMarkers.entries()) {
@@ -1026,7 +1266,8 @@ function setAircraftPhotoCandidates(urls, description, fallbackTerms = null) {
   tryNext();
 }
 
-// LOCAL_TAR1090_AIRCRAFT_CACHE_UI_FALLBACK_PATCH_V1
+
+// LOCAL_TAR1090_AIRCRAFT_CACHE_UI_FALLBACK_SAFE_V2
 async function fetchLocalAircraftCacheEnrichment(identifier) {
   const hex = String(identifier || '').replace(/^~/, '').trim().toUpperCase();
   if (!/^[0-9A-F]{6}$/.test(hex)) return null;
@@ -1034,6 +1275,7 @@ async function fetchLocalAircraftCacheEnrichment(identifier) {
   try {
     const response = await jsonRequest(`/api/aircraft/local?hex=${encodeURIComponent(hex)}`);
     if (!response || !response.found || !response.aircraft) return null;
+
     return {
       aircraft: response.aircraft,
       flightroute: null,
@@ -1044,7 +1286,7 @@ async function fetchLocalAircraftCacheEnrichment(identifier) {
   }
 }
 
-// /LOCAL_TAR1090_AIRCRAFT_CACHE_UI_FALLBACK_PATCH_V1
+// /LOCAL_TAR1090_AIRCRAFT_CACHE_UI_FALLBACK_SAFE_V2
 
 async function fetchAircraftEnrichment(identifier, callsign = '') {
   if (!identifier) return null;
@@ -1082,7 +1324,7 @@ async function applyAirlabsRouteToDetails(flight) {
       return;
     }
     if (!result.matched) {
-      detailValue('detailRouteSource', 'AirLabs — no route match');
+      detailValue('detailRouteSource', routeNoMatchSourceMessage(flight));
       return;
     }
     detailValue('detailOrigin', formatAirlabsAirport(result.departure_iata, result.departure_icao));
@@ -1093,6 +1335,7 @@ async function applyAirlabsRouteToDetails(flight) {
     detailValue('detailRouteSource', `AirLabs unavailable: ${error.message}`);
   }
 }
+
 
 async function showAircraftDetails(aircraft) {
   const flight = aircraft.flight ? String(aircraft.flight).trim().toUpperCase() : '';
@@ -1334,7 +1577,7 @@ async function requestAirlabsDiagnosticRoute(flight) {
   if (!isAirlabsConfiguredStatus(status)) {
     return normalizeAirlabsRoutePayload(null, status);
   }
-  const payload = await jsonRequest(`/api/diagnostics/airlabs/route?flight_icao=${encodeURIComponent(flight || '')}`);
+  const payload = await fetchAirLabsRouteWithVariants(flight || '');
   return normalizeAirlabsRoutePayload(payload, status);
 }
 async function clearAirlabsRouteCache() {
@@ -3069,3 +3312,5 @@ document.addEventListener('DOMContentLoaded', () => {
 
   document.addEventListener("click", handleUnderMapWx, true);
 })();
+
+

@@ -1,5 +1,87 @@
 # RTL Pi ADS-B Tracker
 
+<!-- V3_3_0_FUNCTIONAL_UPDATE_START -->
+## v3.3.0 Functional Update
+
+Version 3.3.0 adds aircraft-display, enrichment, route-classification, and map-interaction improvements that bring the Raspberry Pi app closer to the newer Windows-style user experience.
+
+### Web UI Structure
+
+The web UI is now maintained as split assets:
+
+- `web/index.html` - page structure
+- `web/app.css` - styling
+- `web/app.js` - browser-side application logic
+
+The backend serves `app.css` and `app.js` directly, and `tools/deploy_api_backend.sh` deploys all three web assets.
+
+### Aircraft Map and Trail Behavior
+
+The live map removes active aircraft markers and active trail layers when aircraft leave the live receiver range. Browser-side trail history is retained separately, so Restore History can still recover retained tracks without leaving stale active trails on the live map.
+
+### Aircraft Details from the Map
+
+Aircraft icons on the map can now be double-clicked to open the same full aircraft details dialog used by the aircraft list. This opens the populated details dialog for the aircraft record associated with the marker rather than a small Leaflet popup.
+
+### Aircraft Metadata and Photo Fallback
+
+Aircraft enrichment now uses layered fallback behavior:
+
+1. ADSBDB lookup when available.
+2. Local tar1090-db aircraft cache by ICAO hex when ADSBDB is incomplete.
+3. Representative aircraft photo fallback by manufacturer/model/operator/type.
+4. Filtering to avoid logos, placeholders, icons, SVGs, and other non-aircraft images.
+5. Local fallback cache for photo decisions.
+
+### Local tar1090 Aircraft Cache
+
+The Pi backend includes a local aircraft lookup endpoint:
+
+```text
+/api/aircraft/local?hex=<ICAO_HEX>
+```
+
+It reads the local aircraft cache from:
+
+```text
+/opt/rtl-pi-adsb-tracker/settings/aircraft_hex_db.json
+```
+
+The UI uses this fallback when ADSBDB does not provide aircraft data.
+
+### AirLabs Route Enrichment
+
+AirLabs route enrichment remains the scheduled-route source. The UI supports normalized airline callsign retries for route lookups where AirLabs omits leading zeros or uses a simplified ICAO flight number.
+
+Example:
+
+```text
+KAL032 -> KAL32
+```
+
+### Private, Charter, and Tail-Number Callsign Handling
+
+The route-source display now gives clearer messages for callsigns that are not expected to have scheduled airline routes.
+
+Examples:
+
+```text
+KOW523  -> Private/charter callsign - Baker Aviation / Rodeo; route not available from AirLabs
+LYM3583 -> Private/charter callsign - Key Lime Air; route not available from AirLabs
+N653JC  -> Private/general aviation tail-number callsign - N653JC; route not available from AirLabs
+```
+
+This prevents private, charter, regional, or registration-style callsigns from looking like broken scheduled airline route lookups.
+
+### Functional Porting Document
+
+A detailed functional change summary for porting these changes into the Windows version is included at:
+
+```text
+docs/RTL-Pi-ADS-B-Tracker_Functional_Changes_Since_v3.0.md
+```
+<!-- V3_3_0_FUNCTIONAL_UPDATE_END -->
+
 A Raspberry Pi based ADS-B aircraft tracker with a browser map UI, local aircraft detail enrichment, NOAA/WX audio listening, Airband scanning, AirLabs route lookup, and best-guess aircraft photo fallback support.
 
 This project is designed for a Raspberry Pi with two RTL-SDR receivers:
