@@ -58,6 +58,14 @@ scp "${REPO_ROOT}/src/rtl_pi_api.py" \
     "${PI_USER}@${PI_HOST}:${PI_DEPLOY_DIR}/app/rtl_pi_api.py"
 
 scp "${REPO_ROOT}/web/index.html" \
+
+# WEB_ASSET_SPLIT_V3_2_1_DEPLOY: copy split web assets
+if [ -f web/app.css ] && [ -f web/app.js ]; then
+  echo "Deploying split web assets..."
+  ssh "${PI_USER}@${PI_HOST}" "mkdir -p ${PI_DEPLOY_DIR}/web"
+  scp -O web/app.css web/app.js "${PI_USER}@${PI_HOST}:${PI_DEPLOY_DIR}/web/"
+fi
+# /WEB_ASSET_SPLIT_V3_2_1_DEPLOY
     "${PI_USER}@${PI_HOST}:${PI_DEPLOY_DIR}/web/index.html"
 
 if [[ -f "${REPO_ROOT}/data/airband_frequencies_full.json" ]]; then
