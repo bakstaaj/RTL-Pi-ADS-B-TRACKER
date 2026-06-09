@@ -386,6 +386,11 @@ echo "Starting RTL-SDR serial provisioning before application install..."
 prompt_for_rtl_sdr_serial_setup
 
 echo
+echo "Configuring git safe.directory for root-run installer..."
+
+git config --global --add safe.directory "${APP_ROOT}" 2>/dev/null || true
+
+echo
 echo "Cloning or updating application repository..."
 
 if [[ -d "${APP_ROOT}/.git" ]]; then
