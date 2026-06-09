@@ -1,5 +1,32 @@
 # RTL Pi ADS-B Tracker
 
+<!-- RPI_INSTALL_DOC_START -->
+## Fresh Raspberry Pi installation
+
+For a fresh Raspberry Pi OS / Debian Trixie Lite 64-bit install, use the bootstrap installer.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bakstaaj/RTL-Pi-ADS-B-Tracker/main/tools/bootstrap_fresh_pi_install.sh -o /tmp/bootstrap_fresh_pi_install.sh
+
+sudo bash /tmp/bootstrap_fresh_pi_install.sh
+
+sudo reboot
+```
+
+The installer performs apt dependency installation, RTL-SDR serial provisioning, app clone/update, packaged ARM64 `readsb` installation, Python environment setup, systemd service creation, and validation.
+
+Full instructions:
+
+[docs/RASPBERRY_PI_INSTALL.md](docs/RASPBERRY_PI_INSTALL.md)
+
+For already-programmed RTL-SDR dongles:
+
+```bash
+SKIP_SDR_SERIAL_SETUP=1 sudo bash /tmp/bootstrap_fresh_pi_install.sh
+```
+<!-- RPI_INSTALL_DOC_END -->
+
+
 <!-- V3_3_0_FUNCTIONAL_UPDATE_START -->
 ## v3.3.0 Functional Update
 
