@@ -2,10 +2,19 @@
 #
 # Fresh Raspberry Pi bootstrap installer for RTL-Pi-ADS-B-Tracker.
 #
-# Run on the Raspberry Pi:
+# Run on the Raspberry Pi AFTER completing the pre-install apt setup:
+#
+#   sudo apt-get update
+#   sudo apt-get -y full-upgrade
+#   sudo reboot
+#
+# Then:
 #
 #   curl -fsSL https://raw.githubusercontent.com/bakstaaj/RTL-Pi-ADS-B-Tracker/main/tools/bootstrap_fresh_pi_install.sh -o /tmp/bootstrap_fresh_pi_install.sh
 #   sudo bash /tmp/bootstrap_fresh_pi_install.sh
+#
+# This bootstrap intentionally does not run apt update. Apt repository
+# repair/update is a pre-install Pi setup task.
 #
 # Optional:
 #
@@ -286,10 +295,14 @@ systemctl stop rtl-pi-readsb.service 2>/dev/null || true
 
 echo
 echo "Installing all operating system dependencies..."
+echo
+echo "NOTE: This installer intentionally does not run apt update."
+echo "The Pi pre-install setup must complete apt repository repair/update first."
+echo "Expected pre-install command:"
+echo "  sudo apt-get update"
+echo
 
-apt update
-
-apt install -y \
+apt-get install -y \
   ca-certificates \
   curl \
   wget \

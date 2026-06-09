@@ -3,7 +3,15 @@
 <!-- RPI_INSTALL_DOC_START -->
 ## Fresh Raspberry Pi installation
 
-For a fresh Raspberry Pi OS / Debian Trixie Lite 64-bit install, use the bootstrap installer.
+For a fresh Raspberry Pi OS / Debian Trixie Lite 64-bit install, first complete the apt pre-install setup, then run the bootstrap installer.
+
+```bash
+sudo apt-get update
+sudo apt-get -y full-upgrade
+sudo reboot
+```
+
+After reboot:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bakstaaj/RTL-Pi-ADS-B-Tracker/main/tools/bootstrap_fresh_pi_install.sh -o /tmp/bootstrap_fresh_pi_install.sh
@@ -13,7 +21,7 @@ sudo bash /tmp/bootstrap_fresh_pi_install.sh
 sudo reboot
 ```
 
-The installer performs apt dependency installation, RTL-SDR serial provisioning, app clone/update, packaged ARM64 `readsb` installation, Python environment setup, systemd service creation, and validation.
+The installer performs dependency package installation, RTL-SDR serial provisioning, app clone/update, packaged ARM64 `readsb` installation, Python environment setup, systemd service creation, and validation. It intentionally does not run `apt update`; that is a pre-install Pi setup task.
 
 Full instructions:
 

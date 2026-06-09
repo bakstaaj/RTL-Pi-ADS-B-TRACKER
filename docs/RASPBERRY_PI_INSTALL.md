@@ -146,6 +146,30 @@ git push
 
 ---
 
+## Required pre-install Pi setup
+
+Before running the application bootstrap installer, the Pi's apt repositories must already be working.
+
+Run this on the Pi first:
+
+```bash
+sudo apt-get update
+sudo apt-get -y full-upgrade
+sudo reboot
+```
+
+After reboot, confirm apt is healthy:
+
+```bash
+sudo apt-get update
+```
+
+The application bootstrap installer intentionally does **not** run `apt update`. If apt repositories, DNS, mirrors, proxy, captive portal, or package signatures are broken, fix those before running the application installer.
+
+Once `sudo apt-get update` completes cleanly, continue with the fresh Pi install below.
+
+---
+
 ## Fresh Pi one-command install
 
 On the fresh Raspberry Pi, run:
@@ -156,7 +180,7 @@ curl -fsSL https://raw.githubusercontent.com/bakstaaj/RTL-Pi-ADS-B-Tracker/main/
 sudo bash /tmp/bootstrap_fresh_pi_install.sh
 ```
 
-The installer handles the apt installs, RTL-SDR serial setup, repo clone, app install, systemd services, and startup validation.
+The installer handles dependency package installation, RTL-SDR serial setup, repo clone, app install, systemd services, and startup validation. It does not run `apt update`; that is a required pre-install Pi setup task.
 
 After the installer completes, reboot once:
 
@@ -232,7 +256,7 @@ APP_REF=v3.3.0 SKIP_SDR_SERIAL_SETUP=1 sudo bash /tmp/bootstrap_fresh_pi_install
 
 ## Apt packages installed by the bootstrap script
 
-The bootstrap installer installs the required operating system dependencies in one apt step, including:
+After the pre-install apt update has completed successfully, the bootstrap installer installs the required operating system dependencies in one apt-get install step, including:
 
 ```text
 ca-certificates
@@ -573,6 +597,14 @@ hostname -I
 Brand-new Pi:
 
 ```bash
+sudo apt-get update
+sudo apt-get -y full-upgrade
+sudo reboot
+```
+
+After reboot:
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/bakstaaj/RTL-Pi-ADS-B-Tracker/main/tools/bootstrap_fresh_pi_install.sh -o /tmp/bootstrap_fresh_pi_install.sh
 
 sudo bash /tmp/bootstrap_fresh_pi_install.sh
@@ -581,6 +613,14 @@ sudo reboot
 ```
 
 Pi with already-programmed dongles:
+
+```bash
+sudo apt-get update
+sudo apt-get -y full-upgrade
+sudo reboot
+```
+
+After reboot:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bakstaaj/RTL-Pi-ADS-B-Tracker/main/tools/bootstrap_fresh_pi_install.sh -o /tmp/bootstrap_fresh_pi_install.sh
