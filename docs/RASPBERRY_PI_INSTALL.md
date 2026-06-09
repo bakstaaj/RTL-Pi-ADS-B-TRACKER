@@ -254,9 +254,30 @@ APP_REF=v3.3.0 SKIP_SDR_SERIAL_SETUP=1 sudo bash /tmp/bootstrap_fresh_pi_install
 
 ---
 
+## Runtime-only Pi install
+
+The Raspberry Pi is treated as a runtime target.
+
+The bootstrap installer does **not** install compiler/build packages such as:
+
+```text
+c```
+
+The app-owned `readsb` binary is cross-compiled on the development machine and committed under:
+
+```text
+vendor/readsb/linux-aarch64/readsb
+```
+
+Any other required native helper binaries should also be packaged before release. The Pi installer should not compile native code during normal deployment.
+
+The installer still installs `git` because the current bootstrap workflow uses `git clone` and `git fetch` to install and update the repository. If we later switch to GitHub release archives, `git` can also be removed.
+
+---
+
 ## Apt packages installed by the bootstrap script
 
-After the pre-install apt update has completed successfully, the bootstrap installer installs the required operating system dependencies in one apt-get install step, including:
+After the pre-install apt update has completed successfully, the bootstrap installer installs the required runtime operating system dependencies in one apt-get install step, including:
 
 ```text
 ca-certificates
@@ -278,17 +299,8 @@ python3
 python3-full
 python3-venv
 python3-pip
-python3-dev
-build-essential
-make
-cmake
-pkg-config
-gcc
-g++
-libusb-1.0-0
-libusb-1.0-0-dev
+clibusb-1.0-0
 librtlsdr0
-librtlsdr-dev
 rtl-sdr
 zlib1g
 libzstd1

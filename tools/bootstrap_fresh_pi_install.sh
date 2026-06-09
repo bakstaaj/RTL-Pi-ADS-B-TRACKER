@@ -294,14 +294,16 @@ systemctl stop rtl-pi-adsb-tracker.service 2>/dev/null || true
 systemctl stop rtl-pi-readsb.service 2>/dev/null || true
 
 echo
-echo "Installing all operating system dependencies..."
+echo
+echo "Installing runtime operating system dependencies..."
 echo
 echo "NOTE: This installer intentionally does not run apt update."
 echo "The Pi pre-install setup must complete apt repository repair/update first."
 echo "Expected pre-install command:"
 echo "  sudo apt-get update"
 echo
-
+echo "This is a runtime install. Compiler/build packages are not installed."
+echo
 apt-get install -y \
   ca-certificates \
   curl \
@@ -322,17 +324,8 @@ apt-get install -y \
   python3-full \
   python3-venv \
   python3-pip \
-  python3-dev \
-  build-essential \
-  make \
-  cmake \
-  pkg-config \
-  gcc \
-  g++ \
   libusb-1.0-0 \
-  libusb-1.0-0-dev \
   librtlsdr0 \
-  librtlsdr-dev \
   rtl-sdr \
   zlib1g \
   libzstd1 \
@@ -477,19 +470,9 @@ echo "Checking readsb runtime library dependencies..."
 ldd "${INSTALLED_READSB}" || true
 
 echo
-echo "Building optional native helper binaries if the repo provides a build path..."
+echo "Skipping native helper builds on the Pi."
+echo "This installer is runtime-only; native binaries must be packaged before release."
 
-cd "${APP_ROOT}"
-
-if [[ -x "${APP_ROOT}/tools/build_native.sh" ]]; then
-  sudo -u "${APP_USER}" bash "${APP_ROOT}/tools/build_native.sh"
-elif [[ -x "${APP_ROOT}/scripts/build_native.sh" ]]; then
-  sudo -u "${APP_USER}" bash "${APP_ROOT}/scripts/build_native.sh"
-elif [[ -f "${APP_ROOT}/Makefile" ]]; then
-  sudo -u "${APP_USER}" make
-else
-  echo "No native helper build script or top-level Makefile found; skipping helper build."
-fi
 
 echo
 echo "Creating Python virtual environment and installing Python dependencies..."
