@@ -3313,4 +3313,176 @@ document.addEventListener('DOMContentLoaded', () => {
   document.addEventListener("click", handleUnderMapWx, true);
 })();
 
+/*
+ * RTL_PI_RECEIVER_LOCATION_MAP_PICK_PLACEMENT_V3
+ *
+ * Keep the receiver-location "pick location on map" control grouped with the
+ * receiver name / latitude / longitude controls. This uses runtime DOM
+ * placement so it works with both static and generated menu markup.
+ */
+(function ensureReceiverLocationMapPickControlPlacement() {
+  let observerStarted = false;
+  let lastRun = 0;
 
+  function textOf(el) {
+    if (!el) return "";
+    const parts = [
+      el.textContent,
+      el.value,
+      el.title,
+      el.ariaLabel,
+      el.getAttribute && el.getAttribute("aria-label"),
+      el.getAttribute && el.getAttribute("data-action"),
+      el.id,
+      el.name,
+      el.className
+    ];
+    return parts.filter(Boolean).join(" ").toLowerCase().replace(/\s+/g, " ").trim();
+  }
+
+  function isMapPickControl(el) {
+    const t = textOf(el);
+    return /\bmap\b/.test(t)
+      && /\b(pick|select|choose|set|place|drop|locate)\b/.test(t)
+      && /\b(location|receiver|lat|latitude|lon|lng|longitude)\b/.test(t);
+  }
+
+  function rowFor(el) {
+    if (!el) return null;
+    const selectors = [
+      ".form-row",
+      ".field-row",
+      ".control-row",
+      ".setting-row",
+      ".menu-row",
+      ".button-row",
+      ".form-group",
+      ".input-group",
+      ".location-row",
+      ".receiver-location-row",
+      "label",
+      "p",
+      "li",
+      "div"
+    ];
+
+    for (const selector of selectors) {
+      const row = el.closest(selector);
+      if (row && row !== document.body && row !== document.documentElement && textOf(row).length < 500) {
+        return row;
+      }
+    }
+
+    return el;
+  }
+
+  function scoreLocationContainer(el) {
+    const t = textOf(el);
+    if (!t) return 0;
+
+    let score = 0;
+    if (/\breceiver location\b/.test(t)) score += 12;
+    if (/\blocation\b/.test(t)) score += 3;
+    if (/\blatitude\b|\blat\b/.test(t)) score += 4;
+    if (/\blongitude\b|\blon\b|\blng\b/.test(t)) score += 4;
+    if (/\bname\b/.test(t)) score += 1;
+    if (/\baircraft\b|\btrail\b|\bnoaa\b|\bairband\b|\bscanner\b/.test(t)) score -= 3;
+
+    const fields = Array.from(el.querySelectorAll("input, select, textarea, label"));
+    for (const field of fields) {
+      const ft = textOf(field);
+      if (/\blatitude\b|\blat\b/.test(ft)) score += 2;
+      if (/\blongitude\b|\blon\b|\blng\b/.test(ft)) score += 2;
+      if (/\breceiver location\b|\blocation name\b/.test(ft)) score += 2;
+    }
+
+    return score;
+  }
+
+  function findLocationContainer() {
+    const selectors = [
+      "fieldset",
+      "details",
+      "section",
+      ".card",
+      ".panel",
+      ".menu-section",
+      ".settings-section",
+      ".config-section",
+      ".control-section",
+      ".control-group",
+      ".settings-group",
+      ".form-section",
+      "div"
+    ];
+
+    return Array.from(document.querySelectorAll(selectors.join(",")))
+      .map((el) => ({ el, score: scoreLocationContainer(el), size: el.querySelectorAll("*").length }))
+      .filter((x) => x.score >= 10)
+      .sort((a, b) => (b.score - a.score) || (a.size - b.size))[0]?.el || null;
+  }
+
+  function findInsertionRow(container) {
+    if (!container) return null;
+
+    const fields = Array.from(container.querySelectorAll("input, select, textarea"));
+    const locationFields = fields.filter((field) => {
+      const t = textOf(field);
+      return /\blocation\b|\blatitude\b|\blat\b|\blongitude\b|\blon\b|\blng\b|\bname\b/.test(t);
+    });
+
+    if (!locationFields.length) return null;
+    return rowFor(locationFields[locationFields.length - 1]);
+  }
+
+  function moveControl() {
+    const now = Date.now();
+    if (now - lastRun < 200) return;
+    lastRun = now;
+
+    const container = findLocationContainer();
+    if (!container) return;
+
+    const control = Array.from(document.querySelectorAll("button, a, input[type='button'], input[type='submit']"))
+      .find(isMapPickControl);
+
+    if (!control) return;
+
+    const controlRow = rowFor(control);
+    if (!controlRow || container.contains(controlRow)) return;
+
+    const insertionRow = findInsertionRow(container);
+
+    if (insertionRow && insertionRow.parentNode === container) {
+      insertionRow.insertAdjacentElement("afterend", controlRow);
+    } else {
+      container.appendChild(controlRow);
+    }
+
+    controlRow.classList.add("receiver-location-map-pick-control--moved");
+    control.setAttribute("data-placement", "receiver-location-controls");
+  }
+
+  function scheduleMove() {
+    window.requestAnimationFrame(moveControl);
+  }
+
+  function startObserver() {
+    if (observerStarted || !document.body || !window.MutationObserver) return;
+    observerStarted = true;
+    new MutationObserver(scheduleMove).observe(document.body, { childList: true, subtree: true });
+  }
+
+  function init() {
+    scheduleMove();
+    setTimeout(scheduleMove, 250);
+    setTimeout(scheduleMove, 1000);
+    startObserver();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init, { once: true });
+  } else {
+    init();
+  }
+})();
