@@ -21,7 +21,7 @@ sudo bash /tmp/bootstrap_fresh_pi_install.sh
 sudo reboot
 ```
 
-The installer performs runtime dependency package installation, RTL-SDR serial provisioning, app clone/update, packaged ARM64 `readsb` installation, Python environment setup, systemd service creation, and validation. It intentionally does not run `apt update`; that is a pre-install Pi setup task.
+The installer performs runtime dependency package installation, RTL-SDR serial provisioning, app clone/update, packaged ARM64 `readsb` installation, Python environment setup, systemd service creation, validation, and final LAN IP / web URL display. It intentionally does not run `apt update`; that is a pre-install Pi setup task.
 
 Full instructions:
 

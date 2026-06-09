@@ -59,6 +59,45 @@ on_error() {
 
 trap 'on_error $LINENO' ERR
 
+
+display_final_lan_urls() {
+  local ips
+  local ip
+
+  echo
+  echo "============================================================"
+  echo "LAN access information"
+  echo "============================================================"
+
+  ips="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -v '^127\.' | sort -u || true)"
+
+  if [[ -z "${ips}" ]]; then
+    echo "WARNING: Could not determine a non-loopback IPv4 LAN address."
+    echo
+    echo "Try this after reboot:"
+    echo "  hostname -I"
+    echo
+    echo "Then open:"
+    echo "  http://<pi-ip-address>:${WEB_PORT}"
+  else
+    echo "Detected Pi LAN IPv4 address(es):"
+    echo
+    for ip in ${ips}; do
+      echo "  ${ip}"
+    done
+
+    echo
+    echo "Open the RTL ADS-B Tracker web UI from another computer:"
+    echo
+    for ip in ${ips}; do
+      echo "  http://${ip}:${WEB_PORT}"
+    done
+  fi
+
+  echo "============================================================"
+}
+
+
 prompt_enter() {
   local message="$1"
   echo
@@ -670,17 +709,11 @@ set +e
 curl -s "http://127.0.0.1:${WEB_PORT}/api/status" | jq . || true
 set -e
 
-echo
-echo "Network addresses:"
-
-hostname -I || true
+display_final_lan_urls
 
 echo
 echo "============================================================"
 echo "Fresh Pi install complete."
-echo
-echo "Open the UI from another machine:"
-echo "  http://<pi-ip-address>:${WEB_PORT}"
 echo
 echo "Useful commands:"
 echo "  journalctl -u rtl-pi-readsb.service -f"

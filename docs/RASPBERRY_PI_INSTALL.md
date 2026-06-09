@@ -388,6 +388,37 @@ sudo lsof /dev/bus/usb/*/* 2>/dev/null | grep -E 'rtl|readsb|python' || true
 
 ---
 
+## Final installer LAN IP display
+
+At the end of the bootstrap install, the script detects the Pi's non-loopback IPv4 LAN address using `hostname -I` and prints direct web UI URLs.
+
+Example final output:
+
+```text
+LAN access information
+Detected Pi LAN IPv4 address(es):
+
+  192.168.1.50
+
+Open the RTL ADS-B Tracker web UI from another computer:
+
+  http://192.168.1.50:8090
+```
+
+If no LAN IP is detected, run this after reboot:
+
+```bash
+hostname -I
+```
+
+Then open:
+
+```text
+http://<pi-ip-address>:8090
+```
+
+---
+
 ## Open the web UI
 
 Find the Pi IP address:
