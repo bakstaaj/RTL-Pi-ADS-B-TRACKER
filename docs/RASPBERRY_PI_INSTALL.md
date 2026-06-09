@@ -246,7 +246,7 @@ APP_REF=v3.3.0 SKIP_SDR_SERIAL_SETUP=1 sudo bash /tmp/bootstrap_fresh_pi_install
 |---|---|
 | Application root | `/opt/rtl-pi-adsb-tracker` |
 | App-owned readsb | `/opt/rtl-pi-adsb-tracker/bin/readsb` |
-| Aircraft JSON | `/run/readsb/aircraft.json` |
+| Aircraft JSON | `/run/rtl-pi-readsb/aircraft.json` |
 | App config | `/opt/rtl-pi-adsb-tracker/settings/local_config.json` |
 | Runtime data | `/opt/rtl-pi-adsb-tracker/runtime` |
 | Installer log | `/var/log/rtl-pi-adsb-tracker/fresh_pi_install.log` |
@@ -333,7 +333,7 @@ This service runs:
 It writes aircraft JSON to:
 
 ```text
-/run/readsb/aircraft.json
+/run/rtl-pi-readsb/aircraft.json
 ```
 
 ### Web/API service
@@ -364,7 +364,7 @@ curl -s http://127.0.0.1:8090/api/status | jq .
 Check ADS-B JSON:
 
 ```bash
-cat /run/readsb/aircraft.json | jq '{messages, aircraft_count:(.aircraft|length)}'
+cat /run/rtl-pi-readsb/aircraft.json | jq '{messages, aircraft_count:(.aircraft|length)}'
 ```
 
 Check RTL-SDR serial numbers:

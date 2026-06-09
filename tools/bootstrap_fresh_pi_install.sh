@@ -512,7 +512,7 @@ if [[ ! -f "${APP_ROOT}/settings/local_config.json" ]]; then
 {
   "adsb_receiver_serial": "${ADSB_SERIAL}",
   "audio_receiver_serial": "${AUDIO_SERIAL}",
-  "readsb_aircraft_json": "/run/readsb/aircraft.json",
+  "readsb_aircraft_json": "/run/rtl-pi-readsb/aircraft.json",
   "host": "${WEB_HOST}",
   "port": ${WEB_PORT},
   "noaa_rf_gain_db": 40.2,
@@ -560,7 +560,7 @@ Type=simple
 User=${APP_USER}
 Group=${APP_GROUP}
 SupplementaryGroups=plugdev video dialout
-RuntimeDirectory=readsb
+RuntimeDirectory=rtl-pi-readsb
 RuntimeDirectoryMode=0755
 ExecStart=${INSTALLED_READSB} \\
   --device-type rtlsdr \\
@@ -574,7 +574,7 @@ ExecStart=${INSTALLED_READSB} \\
   --net-sbs-port 30003 \\
   --net-bi-port 30004 \\
   --net-bo-port 30005 \\
-  --write-json /run/readsb \\
+  --write-json /run/rtl-pi-readsb \\
   --write-json-every 1 \\
   --quiet
 Restart=always
@@ -610,7 +610,7 @@ SupplementaryGroups=plugdev video dialout
 WorkingDirectory=${APP_ROOT}
 Environment=PYTHONUNBUFFERED=1
 Environment=RTL_PI_APP_ROOT=${APP_ROOT}
-Environment=RTL_PI_READSB_JSON=/run/readsb/aircraft.json
+Environment=RTL_PI_READSB_JSON=/run/rtl-pi-readsb/aircraft.json
 Environment=RTL_PI_ADSB_SERIAL=${ADSB_SERIAL}
 Environment=RTL_PI_AUDIO_SERIAL=${AUDIO_SERIAL}
 Environment=RTL_PI_HOST=${WEB_HOST}
@@ -656,11 +656,11 @@ journalctl -u rtl-pi-adsb-tracker.service -n 40 --no-pager || true
 echo
 echo "ADS-B JSON check:"
 
-if [[ -f /run/readsb/aircraft.json ]]; then
-  ls -lh /run/readsb/aircraft.json
-  cat /run/readsb/aircraft.json | jq '{messages, aircraft_count:(.aircraft|length)}' || true
+if [[ -f /run/rtl-pi-readsb/aircraft.json ]]; then
+  ls -lh /run/rtl-pi-readsb/aircraft.json
+  cat /run/rtl-pi-readsb/aircraft.json | jq '{messages, aircraft_count:(.aircraft|length)}' || true
 else
-  echo "WARNING: /run/readsb/aircraft.json not found yet."
+  echo "WARNING: /run/rtl-pi-readsb/aircraft.json not found yet."
 fi
 
 echo
